@@ -322,6 +322,13 @@ export class OpenaiCompatService implements OnModuleInit {
       }
     }
 
+    // ── Integrity check: strip orphan tool_calls ─────────────────────
+    // Context truncation may drop tool_result messages while keeping the
+    // corresponding assistant tool_calls block. OpenAI API requires every
+    // tool_call to have a matching tool response. Strip orphan tool_calls
+    // and orphan tool responses to prevent 400 errors.
+    this.sanitizeToolCallIntegrity(messages)
+
     // Build request
     const request: ChatCompletionRequest = {
       model: dto.model,
@@ -365,6 +372,76 @@ export class OpenaiCompatService implements OnModuleInit {
     }
 
     return request
+  }
+
+  // ── Tool call integrity sanitizer ─────────────────────────────────
+
+  /**
+   * Ensure every assistant tool_call has a matching tool response and
+   * every tool response has a matching tool_call. Strip any orphans.
+   * Mutates the array in-place.
+   */
+  private sanitizeToolCallIntegrity(messages: ChatCompletionMessage[]): void {
+    // Collect all tool response IDs
+    const toolResponseIds = new Set<string>()
+    for (const msg of messages) {
+      if (msg.role === "tool" && msg.tool_call_id) {
+        toolResponseIds.add(msg.tool_call_id)
+      }
+    }
+
+    // Collect all tool_call IDs
+    const toolCallIds = new Set<string>()
+    for (const msg of messages) {
+      if (msg.role === "assistant" && msg.tool_calls) {
+        for (const tc of msg.tool_calls) {
+          toolCallIds.add(tc.id)
+        }
+      }
+    }
+
+    // Strip orphan tool_calls from assistant messages (no matching tool response)
+    for (const msg of messages) {
+      if (msg.role !== "assistant" || !msg.tool_calls) continue
+
+      const before = msg.tool_calls.length
+      msg.tool_calls = msg.tool_calls.filter((tc) => toolResponseIds.has(tc.id))
+
+      if (msg.tool_calls.length < before) {
+        this.logger.warn(
+          `[sanitize] Stripped ${before - msg.tool_calls.length} orphan tool_call(s) from assistant message`
+        )
+      }
+      if (msg.tool_calls.length === 0) {
+        delete msg.tool_calls
+      }
+    }
+
+    // Strip orphan tool responses (no matching tool_call)
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const msg = messages[i]
+      if (msg && msg.role === "tool" && msg.tool_call_id) {
+        if (!toolCallIds.has(msg.tool_call_id)) {
+          this.logger.warn(
+            `[sanitize] Stripped orphan tool response: ${msg.tool_call_id}`
+          )
+          messages.splice(i, 1)
+        }
+      }
+    }
+
+    // Remove empty assistant messages (had only tool_calls, all stripped)
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const msg = messages[i]
+      if (
+        msg &&
+        msg.role === "assistant" &&
+        !msg.tool_calls &&
+        (!msg.content || msg.content === "")
+      ) {
+        messages.splice(i, 1)
+      }
+    }
   }
 
   // ── URL builder ──────────────────────────────────────────────────────

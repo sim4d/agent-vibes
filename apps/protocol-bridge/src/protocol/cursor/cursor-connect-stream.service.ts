@@ -6589,11 +6589,17 @@ export class CursorConnectStreamService {
         }
       }
     } catch (error) {
-      this.logger.error("Error streaming from Google backend", error)
+      const backendLabel = route.backend
+      this.logger.error(
+        `Error streaming from ${backendLabel} backend (cursorModel=${parsed.model}, backendModel=${backendModel})`,
+        error
+      )
       // Don't throw raw error - it may contain circular references
       const errorMessage =
         error instanceof Error ? error.message : String(error)
-      throw new Error(`Google backend streaming failed: ${errorMessage}`)
+      throw new Error(
+        `${backendLabel} backend streaming failed: ${errorMessage}`
+      )
     }
   }
 
@@ -6624,6 +6630,41 @@ export class CursorConnectStreamService {
    *
    * We send real-time UI updates and only complete the tool call on exit.
    */
+  private *emitPostToolContinuationError(
+    conversationId: string,
+    backend: BackendType,
+    error: unknown,
+    context: {
+      toolCallId: string
+      toolName: string
+      cursorModel: string
+      backendModel: string
+    }
+  ): AsyncGenerator<Buffer> {
+    const errorMessage = error instanceof Error ? error.message : String(error)
+    const summary =
+      `Tool ${context.toolName} (${context.toolCallId}) completed, ` +
+      `but post-tool continuation failed on ${backend} backend: ${errorMessage}`
+
+    this.logger.error(
+      `[PostToolContinuation] ${summary} ` +
+        `(cursorModel=${context.cursorModel}, backendModel=${context.backendModel})`,
+      error instanceof Error ? error.stack : undefined
+    )
+
+    if (/rate limit|usage limit|429/i.test(errorMessage)) {
+      this.logger.warn(
+        `[PostToolContinuation] Backend appears rate-limited; ` +
+          `tool execution succeeded but agent continuation could not continue automatically`
+      )
+    }
+
+    const heartbeat = this.grpcService.createServerHeartbeatResponse()
+    yield heartbeat
+    const turnEnded = this.grpcService.createAgentTurnEndedResponse()
+    yield turnEnded
+  }
+
   private async *handleShellStreamEvent(
     conversationId: string,
     toolCallId: string,
@@ -6858,6 +6899,7 @@ export class CursorConnectStreamService {
       // Continue AI generation
       const route = this.modelRouter.resolveModel(session.model)
       const backendModel = route.model
+      const backendLabel = route.backend
 
       const toolsToUse = session.supportedTools || []
       if (toolsToUse.length === 0) {
@@ -6916,7 +6958,6 @@ export class CursorConnectStreamService {
         }
       }
 
-      const stream = this.getBackendStream(dto)
       let accumulatedText = ""
       const continuationModelCallBaseId = crypto.randomUUID()
       let continuationToolCallIndex = 0
@@ -6928,109 +6969,128 @@ export class CursorConnectStreamService {
 
       let currentToolCall: ActiveToolCall | null = null
 
-      for await (const sseEvent of stream) {
-        const event = this.parseSseEvent(sseEvent)
-        if (!event) continue
+      try {
+        const stream = this.getBackendStream(dto)
 
-        if (event.type === "content_block_start") {
-          const contentBlock = event.data.content_block
-          if (
-            contentBlock?.type === "tool_use" &&
-            contentBlock.id &&
-            contentBlock.name
-          ) {
-            const modelCallId = this.generateModelCallId(
-              continuationModelCallBaseId,
-              continuationToolCallIndex++
-            )
-            currentToolCall = {
-              id: contentBlock.id,
-              name: contentBlock.name,
-              inputJson: "",
-              modelCallId,
+        for await (const sseEvent of stream) {
+          const event = this.parseSseEvent(sseEvent)
+          if (!event) continue
+
+          if (event.type === "content_block_start") {
+            const contentBlock = event.data.content_block
+            if (
+              contentBlock?.type === "tool_use" &&
+              contentBlock.id &&
+              contentBlock.name
+            ) {
+              const modelCallId = this.generateModelCallId(
+                continuationModelCallBaseId,
+                continuationToolCallIndex++
+              )
+              currentToolCall = {
+                id: contentBlock.id,
+                name: contentBlock.name,
+                inputJson: "",
+                modelCallId,
+              }
+            } else if (contentBlock?.type === "thinking") {
+              // Thinking block started
+              isInThinkingBlock = true
+              thinkingStartTime = Date.now()
             }
-          } else if (contentBlock?.type === "thinking") {
-            // Thinking block started
-            isInThinkingBlock = true
-            thinkingStartTime = Date.now()
-          }
-        } else if (event.type === "content_block_delta") {
-          const delta = event.data.delta
-          if (delta?.type === "text_delta" && delta.text) {
-            const textResponse = this.grpcService.createAgentTextResponse(
-              delta.text
-            )
-            yield textResponse
-            accumulatedText += delta.text
-          } else if (delta?.type === "input_json_delta" && currentToolCall) {
-            currentToolCall.inputJson += delta.partial_json || ""
-            // Suppress per-chunk partial tool deltas to avoid duplicated tool
-            // markers in plain-text fallback UI.
-          } else if (delta?.type === "thinking_delta" && delta.thinking) {
-            // Send thinking delta
-            yield this.grpcService.createThinkingDeltaResponse(delta.thinking)
-          }
-        } else if (event.type === "content_block_stop") {
-          // Handle thinking block end
-          if (isInThinkingBlock) {
-            const thinkingDurationMs = Date.now() - thinkingStartTime
-            yield this.grpcService.createThinkingCompletedResponse(
-              thinkingDurationMs
-            )
-            isInThinkingBlock = false
-          }
-          if (currentToolCall) {
-            const dispatchOutcome =
-              yield* this.registerAndDispatchToolInvocation({
-                conversationId,
-                session,
-                toolCall: currentToolCall,
-                accumulatedText,
-                checkpointModel: session.model,
-                workspaceRootPath: session.projectContext?.rootPath,
-              })
-            if (dispatchOutcome === "waiting_for_result") {
-              this.logger.log(`Waiting for tool result: ${currentToolCall.id}`)
+          } else if (event.type === "content_block_delta") {
+            const delta = event.data.delta
+            if (delta?.type === "text_delta" && delta.text) {
+              const textResponse = this.grpcService.createAgentTextResponse(
+                delta.text
+              )
+              yield textResponse
+              accumulatedText += delta.text
+            } else if (delta?.type === "input_json_delta" && currentToolCall) {
+              currentToolCall.inputJson += delta.partial_json || ""
+              // Suppress per-chunk partial tool deltas to avoid duplicated tool
+              // markers in plain-text fallback UI.
+            } else if (delta?.type === "thinking_delta" && delta.thinking) {
+              // Send thinking delta
+              yield this.grpcService.createThinkingDeltaResponse(delta.thinking)
             }
-            return
-          }
-        } else if (event.type === "message_stop") {
-          // AI finished without more tool calls
-          if (accumulatedText) {
-            this.sessionManager.addMessage(
-              session.conversationId,
-              "assistant",
-              accumulatedText
-            )
-          }
+          } else if (event.type === "content_block_stop") {
+            // Handle thinking block end
+            if (isInThinkingBlock) {
+              const thinkingDurationMs = Date.now() - thinkingStartTime
+              yield this.grpcService.createThinkingCompletedResponse(
+                thinkingDurationMs
+              )
+              isInThinkingBlock = false
+            }
+            if (currentToolCall) {
+              const dispatchOutcome =
+                yield* this.registerAndDispatchToolInvocation({
+                  conversationId,
+                  session,
+                  toolCall: currentToolCall,
+                  accumulatedText,
+                  checkpointModel: session.model,
+                  workspaceRootPath: session.projectContext?.rootPath,
+                })
+              if (dispatchOutcome === "waiting_for_result") {
+                this.logger.log(
+                  `Waiting for tool result: ${currentToolCall.id}`
+                )
+              }
+              return
+            }
+          } else if (event.type === "message_stop") {
+            // AI finished without more tool calls
+            if (accumulatedText) {
+              this.sessionManager.addMessage(
+                session.conversationId,
+                "assistant",
+                accumulatedText
+              )
+            }
 
-          // Send turn completion messages（与 handleChatMessage 一致：先 checkpoint 再 turnEnded）
-          const checkpointData = {
-            messageBlobIds: session.messageBlobIds,
-            usedTokens: session.usedTokens,
-            maxTokens: this.resolveCheckpointMaxTokens(session),
-            workspaceUri: session.projectContext?.rootPath
-              ? `file://${session.projectContext.rootPath}`
-              : undefined,
-            readPaths: Array.from(session.readPaths),
-            fileStates: Object.fromEntries(session.fileStates),
-            turns: session.turns,
-            todos: session.todos,
+            // Send turn completion messages（与 handleChatMessage 一致：先 checkpoint 再 turnEnded）
+            const checkpointData = {
+              messageBlobIds: session.messageBlobIds,
+              usedTokens: session.usedTokens,
+              maxTokens: this.resolveCheckpointMaxTokens(session),
+              workspaceUri: session.projectContext?.rootPath
+                ? `file://${session.projectContext.rootPath}`
+                : undefined,
+              readPaths: Array.from(session.readPaths),
+              fileStates: Object.fromEntries(session.fileStates),
+              turns: session.turns,
+              todos: session.todos,
+            }
+
+            const checkpoint =
+              this.grpcService.createConversationCheckpointResponse(
+                session.conversationId,
+                session.model,
+                checkpointData
+              )
+            yield checkpoint
+
+            const heartbeat = this.grpcService.createServerHeartbeatResponse()
+            yield heartbeat
+            const turnEnded = this.grpcService.createAgentTurnEndedResponse()
+            yield turnEnded
           }
-
-          const checkpoint =
-            this.grpcService.createConversationCheckpointResponse(
-              session.conversationId,
-              session.model,
-              checkpointData
-            )
-          yield checkpoint
-
-          const heartbeat = this.grpcService.createServerHeartbeatResponse()
-          yield heartbeat
-          const turnEnded = this.grpcService.createAgentTurnEndedResponse()
-          yield turnEnded
         }
+      } catch (error) {
+        yield* this.emitPostToolContinuationError(
+          conversationId,
+          backendLabel,
+          error,
+          {
+            toolCallId,
+            toolName: pendingToolCall.toolName,
+            cursorModel: session.model,
+            backendModel,
+          }
+        )
+        return
       }
     }
   }
@@ -7288,24 +7348,16 @@ export class CursorConnectStreamService {
       )
       yield exitResponse
     } else if (this.isEditToolInvocation(pendingToolCall.toolName)) {
-      // For edit tools, send ToolCallDelta with stream content
-      this.logger.debug(
-        `Agent mode: sending ToolCallDeltaUpdate (stream_content) for ${pendingToolCall.toolName}`
-      )
+      // For edit tools, avoid replaying the full replacement text as a live delta.
+      // Cursor can render this as a brand-new unnamed buffer / full-file rewrite.
+      // The structured started/completed payloads already carry the file path and
+      // before/after content needed for a correct edit preview.
       const toolInput = pendingToolCall.toolInput as ToolInputWithPath
       const streamContent = String(toolInput.replace || "")
-      if (streamContent) {
-        const toolCallDelta = this.grpcService.createToolCallDeltaResponse(
-          toolCallId,
-          pendingToolCall.toolName,
-          "stream_content",
-          streamContent,
-          pendingToolCall.modelCallId
-        )
-        if (toolCallDelta.length > 0) {
-          yield toolCallDelta
-        }
-      }
+      this.logger.debug(
+        `Agent mode: suppressing edit stream_content delta for ${pendingToolCall.toolName} ` +
+          `(path=${toolInput.path || "(unknown)"}, length=${streamContent.length})`
+      )
     } else {
       // For other non-shell tools, skip ToolCallDelta
       this.logger.debug(
@@ -7343,6 +7395,11 @@ export class CursorConnectStreamService {
           }
           this.logger.debug(
             `Prepared edit diff data: ${filePath} (before=${beforeContent.length}, after=${afterContent.length} bytes)`
+          )
+          this.logger.debug(
+            `Edit preview payload ready: tool=${pendingToolCall.toolName}, path=${filePath}, ` +
+              `before=${beforeContent.length}, after=${afterContent.length}, ` +
+              `modelCallId=${pendingToolCall.modelCallId || "(none)"}`
           )
 
           // Track file state in session

@@ -123,7 +123,7 @@ export interface PendingToolCall {
   toolCallId: string
   toolName: string
   toolInput: Record<string, unknown>
-  toolFamilyHint?: "mcp"
+  toolFamilyHint?: "mcp" | "edit"
   modelCallId: string
   startedEmitted: boolean
   sentAt: Date
@@ -473,7 +473,9 @@ export class ChatSessionManager implements OnModuleDestroy {
     }
   }
 
-  private loadPersistedSession(conversationId: string): ChatSession | undefined {
+  private loadPersistedSession(
+    conversationId: string
+  ): ChatSession | undefined {
     if (!this.db) return undefined
 
     try {
@@ -598,13 +600,15 @@ export class ChatSessionManager implements OnModuleDestroy {
       execId: session.execId,
       interactionQueryId: session.interactionQueryId,
       todos: [...session.todos],
-      webDocuments: Array.from(session.webDocuments.values()).map((document) => ({
-        url: document.url,
-        title: document.title,
-        contentType: document.contentType,
-        chunks: [...document.chunks],
-        createdAt: this.toTimestamp(document.createdAt),
-      })),
+      webDocuments: Array.from(session.webDocuments.values()).map(
+        (document) => ({
+          url: document.url,
+          title: document.title,
+          contentType: document.contentType,
+          chunks: [...document.chunks],
+          createdAt: this.toTimestamp(document.createdAt),
+        })
+      ),
       subAgentContext: session.subAgentContext
         ? {
             parentToolCallId: session.subAgentContext.parentToolCallId,
@@ -1410,7 +1414,10 @@ export class ChatSessionManager implements OnModuleDestroy {
    * Get session
    */
   getSession(conversationId: string): ChatSession | undefined {
-    return this.sessions.get(conversationId) || this.loadPersistedSession(conversationId)
+    return (
+      this.sessions.get(conversationId) ||
+      this.loadPersistedSession(conversationId)
+    )
   }
 
   /**
