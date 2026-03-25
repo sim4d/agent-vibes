@@ -10,6 +10,7 @@ import {
   resolveCloudCodeModel,
 } from "../../llm/model-registry"
 import { ModelRouterService } from "../../llm/model-router.service"
+import { OpenaiCompatService } from "../../llm/openai-compat/openai-compat.service"
 import type { AnthropicResponse } from "../../shared/anthropic"
 import { CountTokensDto } from "./dto/count-tokens.dto"
 import { CreateMessageDto } from "./dto/create-message.dto"
@@ -27,7 +28,8 @@ export class MessagesService implements OnModuleInit {
     private readonly modelRouter: ModelRouterService,
     private readonly tokenizer: TokenizerService,
     private readonly truncator: ConversationTruncatorService,
-    private readonly codexService: CodexService
+    private readonly codexService: CodexService,
+    private readonly openaiCompatService: OpenaiCompatService
   ) {}
 
   /**
@@ -36,7 +38,8 @@ export class MessagesService implements OnModuleInit {
   async onModuleInit(): Promise<void> {
     await this.modelRouter.initializeRouting(
       () => this.googleService.checkAvailability(),
-      () => this.codexService.checkAvailability()
+      () => this.codexService.checkAvailability(),
+      () => this.openaiCompatService.checkAvailability()
     )
     this.logger.log("Backend availability tests completed")
   }
@@ -234,6 +237,12 @@ export class MessagesService implements OnModuleInit {
     const route = this.modelRouter.resolveModel(dto.model)
     const routedDto = { ...dto, model: route.model }
 
+    // Route to OpenAI-compatible backend
+    if (route.backend === "openai-compat") {
+      this.logger.log(`[ROUTE] OpenAI-compat backend | model: ${route.model}`)
+      return this.openaiCompatService.sendClaudeMessage(routedDto)
+    }
+
     // Route to Codex backend for GPT/O-series models
     if (route.backend === "codex") {
       this.logger.log(`[ROUTE] Codex backend | model: ${route.model}`)
@@ -264,6 +273,15 @@ export class MessagesService implements OnModuleInit {
     // Use ModelRouterService for model-based routing
     const route = this.modelRouter.resolveModel(dto.model)
     const routedDto = { ...dto, model: route.model }
+
+    // Route to OpenAI-compatible backend
+    if (route.backend === "openai-compat") {
+      this.logger.log(
+        `[ROUTE] OpenAI-compat backend | model: ${route.model} | stream: true`
+      )
+      yield* this.openaiCompatService.sendClaudeMessageStream(routedDto)
+      return
+    }
 
     // Route to Codex backend for GPT/O-series models
     if (route.backend === "codex") {

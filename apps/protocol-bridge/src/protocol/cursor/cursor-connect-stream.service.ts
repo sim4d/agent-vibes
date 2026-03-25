@@ -21,6 +21,7 @@ import {
   type WriteResult,
 } from "../../gen/agent/v1_pb"
 import { CodexService } from "../../llm/codex/codex.service"
+import { OpenaiCompatService } from "../../llm/openai-compat/openai-compat.service"
 import { GoogleService } from "../../llm/google/google.service"
 import { BackendType, ModelRouterService } from "../../llm/model-router.service"
 import { CreateMessageDto } from "../anthropic/dto/create-message.dto"
@@ -396,6 +397,7 @@ export class CursorConnectStreamService {
     private readonly grpcService: CursorGrpcService,
     private readonly googleService: GoogleService,
     private readonly codexService: CodexService,
+    private readonly openaiCompatService: OpenaiCompatService,
     private readonly modelRouter: ModelRouterService,
     private readonly kvStorageService: KvStorageService,
     private readonly truncator: ConversationTruncatorService,
@@ -624,6 +626,14 @@ export class CursorConnectStreamService {
   ): AsyncGenerator<string, void, unknown> {
     const route = this.modelRouter.resolveModel(dto.model)
     const routedDto = { ...dto, model: route.model }
+
+    // Route to OpenAI-compatible backend
+    if (route.backend === "openai-compat") {
+      this.logger.log(
+        `Routing to OpenAI-compat backend for model: ${route.model}`
+      )
+      return this.openaiCompatService.sendClaudeMessageStream(routedDto)
+    }
 
     // Route to Codex backend for GPT/O-series models
     if (route.backend === "codex") {
@@ -878,7 +888,9 @@ export class CursorConnectStreamService {
         id: block.id,
         name: typeof block.name === "string" ? block.name : "unknown_tool",
         input:
-          block.input && typeof block.input === "object" && !Array.isArray(block.input)
+          block.input &&
+          typeof block.input === "object" &&
+          !Array.isArray(block.input)
             ? (block.input as Record<string, unknown>)
             : {},
       })
@@ -886,7 +898,9 @@ export class CursorConnectStreamService {
     return toolUses
   }
 
-  private extractToolResultIds(content: MessageContent | undefined): Set<string> {
+  private extractToolResultIds(
+    content: MessageContent | undefined
+  ): Set<string> {
     const ids = new Set<string>()
     if (!Array.isArray(content)) return ids
 
@@ -931,9 +945,9 @@ export class CursorConnectStreamService {
       const message = repairedMessages[i]
       if (!message || message.role !== "assistant") continue
 
-      const interruptedToolUses = this.extractToolUseBlocks(message.content).filter(
-        (toolUse) => interruptedById.has(toolUse.id)
-      )
+      const interruptedToolUses = this.extractToolUseBlocks(
+        message.content
+      ).filter((toolUse) => interruptedById.has(toolUse.id))
       if (interruptedToolUses.length === 0) continue
 
       const syntheticResults: ToolResultContentItem[] = interruptedToolUses.map(
@@ -948,7 +962,9 @@ export class CursorConnectStreamService {
 
       const nextMessage = repairedMessages[i + 1]
       if (nextMessage?.role === "user" && Array.isArray(nextMessage.content)) {
-        const existingToolResultIds = this.extractToolResultIds(nextMessage.content)
+        const existingToolResultIds = this.extractToolResultIds(
+          nextMessage.content
+        )
         const missingResults = syntheticResults.filter(
           (toolResult) => !existingToolResultIds.has(toolResult.tool_use_id)
         )
@@ -975,7 +991,10 @@ export class CursorConnectStreamService {
       repairedMessages,
       `restart recovery: ${session.conversationId}`
     )
-    this.sessionManager.replaceMessages(session.conversationId, normalizedMessages)
+    this.sessionManager.replaceMessages(
+      session.conversationId,
+      normalizedMessages
+    )
   }
 
   private normalizeHistoryForBackend(
@@ -5851,10 +5870,7 @@ export class CursorConnectStreamService {
           const sessionBeforeRun = this.sessionManager.getSession(
             conversationId!
           )
-          if (
-            parsed.isResumeAction &&
-            sessionBeforeRun?.restartRecovery
-          ) {
+          if (parsed.isResumeAction && sessionBeforeRun?.restartRecovery) {
             this.logger.warn(
               `resumeAction hit restored interrupted state for ${conversationId}`
             )

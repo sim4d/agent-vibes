@@ -1,6 +1,5 @@
 import { Injectable, Logger } from "@nestjs/common"
 import {
-  DEFAULT_GEMINI_MODEL,
   detectModelFamily,
   isOpusModel,
   resolveCloudCodeModel,
@@ -11,8 +10,9 @@ import {
  * - google: Gemini-family models via Google Cloud Code
  * - google-claude: Claude family models served by Google Cloud Code
  * - codex: OpenAI GPT/O-series models via Codex reverse proxy
+ * - openai-compat: Third-party OpenAI-compatible API (Chat Completions)
  */
-export type BackendType = "google" | "google-claude" | "codex"
+export type BackendType = "google" | "google-claude" | "codex" | "openai-compat"
 
 /**
  * Model routing result
@@ -29,13 +29,15 @@ export class ModelRouterService {
 
   private googleAvailable = false
   private codexAvailable = false
+  private openaiCompatAvailable = false
 
   /**
    * Keep availability check so startup behavior remains explicit.
    */
   async initializeRouting(
     googleCheck: () => Promise<boolean>,
-    codexCheck?: () => Promise<boolean>
+    codexCheck?: () => Promise<boolean>,
+    openaiCompatCheck?: () => Promise<boolean>
   ): Promise<void> {
     this.logger.log("=== Testing Backend APIs ===")
 
@@ -53,15 +55,33 @@ export class ModelRouterService {
       })
     }
 
+    if (openaiCompatCheck) {
+      this.openaiCompatAvailable = await openaiCompatCheck().catch((e) => {
+        this.logger.error(
+          `OpenAI-compatible check error: ${(e as Error).message}`
+        )
+        return false
+      })
+    }
+
     this.logger.log("=== Backend Availability ===")
     this.logger.log(`  Google Cloud Code: ${this.googleAvailable ? "✓" : "✗"}`)
     this.logger.log(`  Codex (OpenAI):    ${this.codexAvailable ? "✓" : "✗"}`)
+    this.logger.log(
+      `  OpenAI-Compat:     ${this.openaiCompatAvailable ? "✓" : "✗"}`
+    )
     this.logger.log("=== Routing Decision ===")
     this.logger.log("  Gemini/Claude models -> Google backend")
-    if (this.codexAvailable) {
+    if (this.openaiCompatAvailable) {
+      this.logger.log(
+        "  GPT/O-series models  -> OpenAI-compatible backend (priority)"
+      )
+    } else if (this.codexAvailable) {
       this.logger.log("  GPT/O-series models  -> Codex backend")
     } else {
-      this.logger.log("  GPT/O-series models  -> Google fallback (no Codex)")
+      this.logger.log(
+        "  GPT/O-series models  -> ERROR (no GPT backend configured)"
+      )
     }
     this.logger.log("========================")
   }
@@ -77,8 +97,18 @@ export class ModelRouterService {
 
     // 1. Known model with registry entry
     if (entry) {
-      // GPT family → Codex backend (if available)
+      // GPT family → openai-compat (priority) > codex > google fallback
       if (entry.family === "gpt") {
+        if (this.openaiCompatAvailable) {
+          this.logger.log(
+            `[ROUTE] ${cursorModel} -> OpenAI-compat | ${entry.cloudCodeId}`
+          )
+          return {
+            backend: "openai-compat",
+            model: entry.cloudCodeId,
+            isThinking: entry.isThinking,
+          }
+        }
         if (this.codexAvailable) {
           this.logger.log(
             `[ROUTE] ${cursorModel} -> Codex | ${entry.cloudCodeId}`
@@ -90,14 +120,10 @@ export class ModelRouterService {
           }
         }
 
-        this.logger.warn(
-          `[ROUTE] ${cursorModel} requested but no Codex backend available, rerouting to ${DEFAULT_GEMINI_MODEL}`
+        throw new Error(
+          `No GPT backend available for model ${cursorModel}. ` +
+            `Configure OPENAI_COMPAT_BASE_URL + OPENAI_COMPAT_API_KEY or CODEX_API_KEY.`
         )
-        return {
-          backend: "google",
-          model: DEFAULT_GEMINI_MODEL,
-          isThinking: false,
-        }
       }
 
       // Claude/Gemini → Google backend
@@ -126,49 +152,48 @@ export class ModelRouterService {
       }
     }
 
-    // 3. GPT family -> Codex if available, else fallback to Gemini
+    // 3. GPT family -> openai-compat > codex > google fallback
     if (family === "gpt") {
-      if (this.codexAvailable) {
+      const isThinkingModel =
+        normalized.startsWith("o3") ||
+        normalized.startsWith("o4") ||
+        normalized.startsWith("codex")
+
+      if (this.openaiCompatAvailable) {
         this.logger.log(
-          `[ROUTE] ${cursorModel} -> Codex | ${normalized}`
+          `[ROUTE] ${cursorModel} -> OpenAI-compat | ${normalized}`
         )
+        return {
+          backend: "openai-compat",
+          model: normalized,
+          isThinking: isThinkingModel,
+        }
+      }
+      if (this.codexAvailable) {
+        this.logger.log(`[ROUTE] ${cursorModel} -> Codex | ${normalized}`)
         return {
           backend: "codex",
           model: normalized,
-          isThinking:
-            normalized.startsWith("o3") ||
-            normalized.startsWith("o4") ||
-            normalized.startsWith("codex"),
+          isThinking: isThinkingModel,
         }
       }
-      this.logger.warn(
-        `[ROUTE] ${cursorModel} requested but no Codex backend available, rerouting to ${DEFAULT_GEMINI_MODEL}`
+      throw new Error(
+        `No GPT backend available for model ${cursorModel}. ` +
+          `Configure OPENAI_COMPAT_BASE_URL + OPENAI_COMPAT_API_KEY or CODEX_API_KEY.`
       )
-      return {
-        backend: "google",
-        model: DEFAULT_GEMINI_MODEL,
-        isThinking: false,
-      }
     }
 
-    // 4. Known family but not in registry -> reroute to default
+    // 4. Unknown Claude variant not in registry
     if (family === "claude") {
-      this.logger.warn(
-        `[ROUTE] ${cursorModel} requested in Google-only mode, rerouting to ${DEFAULT_GEMINI_MODEL}`
+      throw new Error(
+        `Unknown Claude model ${cursorModel} not in registry. ` +
+          `Supported Claude models are resolved via model-registry.`
       )
-      return {
-        backend: "google",
-        model: DEFAULT_GEMINI_MODEL,
-        isThinking: normalized.includes("thinking"),
-      }
     }
 
-    // 5. Unknown -> default
-    this.logger.log(`[ROUTE] ${cursorModel} -> Google Cloud Code (default)`)
-    return {
-      backend: "google",
-      model: DEFAULT_GEMINI_MODEL,
-      isThinking: normalized.includes("thinking"),
-    }
+    // 5. Unknown model family
+    throw new Error(
+      `Unknown model ${cursorModel}. Supported families: gemini, claude, gpt/o-series.`
+    )
   }
 }
