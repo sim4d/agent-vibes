@@ -1072,79 +1072,30 @@ export class CursorConnectStreamService {
   }
 
   /**
-   * Build a user-friendly error message for backend failures.
-   * Instead of showing "Internal Error", this gives actionable context.
+   * Build backend error text for Cursor users.
+   * Preserve the raw backend error so users can paste it into issue reports.
    */
   private buildBackendErrorMessage(
     backendLabel: string,
     backendModel: string,
     errorMessage: string
   ): string {
-    const header = `⚠️ **${backendLabel} 后端请求失败** (model: ${backendModel})\n\n`
+    const raw = errorMessage.trim().slice(0, 4000)
 
-    // 401 - Auth errors
-    if (
-      errorMessage.includes("401") ||
-      errorMessage.includes("API_KEY_DISABLED") ||
-      errorMessage.includes("Unauthorized") ||
-      errorMessage.includes("API key")
-    ) {
-      return (
-        header +
-        `**原因**: API Key 无效或已被禁用。\n\n` +
-        `**建议**: 请检查 \`apps/protocol-bridge/.env.local\` 中的 \`OPENAI_COMPAT_API_KEY\` 配置，` +
-        `更换有效的 Key 后重启 bridge。\n\n` +
-        `\`\`\`\n${errorMessage.slice(0, 200)}\n\`\`\``
-      )
-    }
-
-    // 429 - Rate limit
-    if (
-      errorMessage.includes("429") ||
-      errorMessage.includes("rate limit") ||
-      errorMessage.includes("Rate limit")
-    ) {
-      return (
-        header +
-        `**原因**: 请求频率超限（Rate Limit）。\n\n` +
-        `**建议**: 请稍等片刻后重试，或切换到其他后端/模型。\n\n` +
-        `\`\`\`\n${errorMessage.slice(0, 200)}\n\`\`\``
-      )
-    }
-
-    // 400 - Bad request / protocol errors
-    if (
-      errorMessage.includes("400") ||
-      errorMessage.includes("No tool output found")
-    ) {
-      return (
-        header +
-        `**原因**: 请求格式错误（可能是 tool 协议不完整）。\n\n` +
-        `**建议**: 请开启新对话重试。如果持续出现，请检查 bridge 日志。\n\n` +
-        `\`\`\`\n${errorMessage.slice(0, 200)}\n\`\`\``
-      )
-    }
-
-    // Timeout / network errors
-    if (
-      errorMessage.includes("ETIMEDOUT") ||
-      errorMessage.includes("ECONNREFUSED") ||
-      errorMessage.includes("timeout") ||
-      errorMessage.includes("fetch failed")
-    ) {
-      return (
-        header +
-        `**原因**: 网络连接失败或超时。\n\n` +
-        `**建议**: 请检查网络连接和代理配置，确认后端 API 地址可达。\n\n` +
-        `\`\`\`\n${errorMessage.slice(0, 200)}\n\`\`\``
-      )
-    }
-
-    // Generic fallback
     return (
-      header +
-      `\`\`\`\n${errorMessage.slice(0, 300)}\n\`\`\`\n\n` +
-      `请检查 bridge 日志获取详细信息。`
+      `⚠️ Backend request failed
+
+` +
+      `backend=${backendLabel}
+` +
+      `model=${backendModel}
+
+` +
+      `Raw error:
+` +
+      `\`\`\`text
+${raw}
+\`\`\``
     )
   }
 
