@@ -66,7 +66,9 @@ export interface ChatSession {
   // Context from initial request
   projectContext?: ParsedCursorRequest["projectContext"]
   codeChunks?: ParsedCursorRequest["codeChunks"]
-  cursorRules?: string[]
+  cursorRules?: ParsedCursorRequest["cursorRules"]
+  cursorCommands?: ParsedCursorRequest["cursorCommands"]
+  customSystemPrompt?: ParsedCursorRequest["customSystemPrompt"]
   explicitContext?: string
   contextTokenLimit?: number
   usedContextTokens?: number
@@ -258,7 +260,9 @@ interface PersistedChatSessionV1 {
   pendingInteractionQueryCount: number
   projectContext?: ParsedCursorRequest["projectContext"]
   codeChunks?: ParsedCursorRequest["codeChunks"]
-  cursorRules?: string[]
+  cursorRules?: ParsedCursorRequest["cursorRules"] | string[]
+  cursorCommands?: ParsedCursorRequest["cursorCommands"]
+  customSystemPrompt?: ParsedCursorRequest["customSystemPrompt"]
   explicitContext?: string
   contextTokenLimit?: number
   usedContextTokens?: number
@@ -558,6 +562,8 @@ export class ChatSessionManager implements OnModuleDestroy {
       projectContext: session.projectContext,
       codeChunks: session.codeChunks,
       cursorRules: session.cursorRules,
+      cursorCommands: session.cursorCommands,
+      customSystemPrompt: session.customSystemPrompt,
       explicitContext: session.explicitContext,
       contextTokenLimit: session.contextTokenLimit,
       usedContextTokens: session.usedContextTokens,
@@ -740,7 +746,11 @@ export class ChatSessionManager implements OnModuleDestroy {
       pendingToolCallByExecId: new Map(),
       projectContext: persisted.projectContext,
       codeChunks: persisted.codeChunks,
-      cursorRules: persisted.cursorRules,
+      cursorRules: Array.isArray(persisted.cursorRules)
+        ? (persisted.cursorRules as ParsedCursorRequest["cursorRules"])
+        : undefined,
+      cursorCommands: persisted.cursorCommands,
+      customSystemPrompt: persisted.customSystemPrompt,
       explicitContext: persisted.explicitContext,
       contextTokenLimit: persisted.contextTokenLimit,
       usedContextTokens: persisted.usedContextTokens,
@@ -800,6 +810,8 @@ export class ChatSessionManager implements OnModuleDestroy {
       projectContext: initialRequest?.projectContext,
       codeChunks: initialRequest?.codeChunks,
       cursorRules: initialRequest?.cursorRules,
+      cursorCommands: initialRequest?.cursorCommands,
+      customSystemPrompt: initialRequest?.customSystemPrompt,
       explicitContext: initialRequest?.explicitContext,
       contextTokenLimit: initialRequest?.contextTokenLimit,
       usedContextTokens: initialRequest?.usedContextTokens,
@@ -870,6 +882,12 @@ export class ChatSessionManager implements OnModuleDestroy {
       }
       if (initialRequest?.cursorRules) {
         session.cursorRules = initialRequest.cursorRules
+      }
+      if (initialRequest?.cursorCommands) {
+        session.cursorCommands = initialRequest.cursorCommands
+      }
+      if (initialRequest?.customSystemPrompt) {
+        session.customSystemPrompt = initialRequest.customSystemPrompt
       }
       if (initialRequest?.explicitContext) {
         session.explicitContext = initialRequest.explicitContext

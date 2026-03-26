@@ -9,9 +9,11 @@ import {
   UnifiedMessage,
 } from "../../context"
 import {
+  CursorRuleSource,
   ExecClientMessageSchema,
   ShellStream,
   type BackgroundShellSpawnResult,
+  type CursorRule,
   type DeleteResult,
   type DiagnosticsResult,
   type GrepResult,
@@ -96,6 +98,17 @@ interface SseEvent {
   type: string
   data: SseEventData
 }
+
+type PromptContext = Pick<
+  ParsedCursorRequest,
+  | "projectContext"
+  | "codeChunks"
+  | "cursorRules"
+  | "cursorCommands"
+  | "customSystemPrompt"
+  | "explicitContext"
+  | "mcpToolDefs"
+>
 
 /**
  * Message content item types - compatible with chat-session.manager.ts MessageContent
@@ -709,6 +722,7 @@ export class CursorConnectStreamService {
       parsed?: ParsedCursorRequest
       session?: ChatSession
       contextTokens?: number
+      systemPrompt?: string
       toolDefinitions?: unknown
     }
   ): {
@@ -738,6 +752,14 @@ export class CursorConnectStreamService {
     }
 
     const contextTokens = options?.contextTokens || 0
+    const protocolSystemPromptTokens = options?.systemPrompt
+      ? this.truncator.countTokens([
+          {
+            role: "user",
+            content: options.systemPrompt,
+          } as UnifiedMessage,
+        ])
+      : 0
     const toolDefinitionTokens = this.estimateJsonTokens(
       options?.toolDefinitions
     )
@@ -752,6 +774,7 @@ export class CursorConnectStreamService {
 
     const systemPromptTokens =
       contextTokens +
+      protocolSystemPromptTokens +
       toolDefinitionTokens +
       backendSystemPromptTokens +
       fixedOverheadTokens
@@ -764,7 +787,7 @@ export class CursorConnectStreamService {
 
     this.logger.debug(
       `Token budget resolved: backend=${backend}, maxTokens=${maxTokens}, ` +
-        `systemPromptTokens=${systemPromptTokens} (context=${contextTokens}, tools=${toolDefinitionTokens}, system=${backendSystemPromptTokens}), ` +
+        `systemPromptTokens=${systemPromptTokens} (context=${contextTokens}, protocolSystem=${protocolSystemPromptTokens}, tools=${toolDefinitionTokens}, backendSystem=${backendSystemPromptTokens}), ` +
         `maxOutput=${maxOutputTokens}`
     )
 
@@ -5872,197 +5895,13 @@ ${raw}
       this.sessionManager.replaceMessages(conversationId, rawMessages)
     }
 
-    // =========================================================================
-    // Build user context messages (matching Antigravity's official contents format)
-    //
-    // Official Antigravity IDE injects context as separate user-role messages
-    // in a strict order BEFORE the actual conversation. Each message carries
-    // an incrementing Step Id. The official system prompt + agent behavior
-    // rules are handled separately in systemInstruction by GoogleService.
-    //
-    // Official order:
-    //   ① <user_information>   — OS, workspace mapping
-    //   ② <mcp_servers>        — available MCP servers
-    //   ③ <artifacts>          — artifact directory path
-    //   ④ <user_rules>         — user custom rules
-    //   ⑤ <workflows>          — workflow definitions
-    //   ⑥ <USER_REQUEST> + <ADDITIONAL_METADATA> — actual user message
-    //   ⑦ Conversation History — recent session summaries  (P2, placeholder)
-    //   ⑧ Knowledge Items      — recent KI summaries       (P2, placeholder)
-    //   ⑨ <EPHEMERAL_MESSAGE>  — system-injected reminders
-    // =========================================================================
-    const contextMessages: Array<{
-      role: "user" | "assistant"
-      content: MessageContent
-    }> = []
-    let stepId = 0
-
-    // ① <user_information> — OS and workspace info
-    if (parsed.projectContext) {
-      const workspaceMappings = parsed.projectContext.directories
-        .map((dir) => `${dir} -> ${dir.split("/").slice(-2).join("/")}`)
-        .join("\n")
-      contextMessages.push({
-        role: "user",
-        content: [
-          "<user_information>",
-          "The USER's OS version is mac.",
-          `The user has ${parsed.projectContext.directories.length} active workspaces, each defined by a URI and a CorpusName. Multiple URIs potentially map to the same CorpusName. The mapping is shown as follows in the format [URI] -> [CorpusName]:`,
-          workspaceMappings,
-          "Code relating to the user's requests should be written in the locations listed above. Avoid writing project code files to tmp, in the .gemini dir, or directly to the Desktop and similar folders unless explicitly asked.",
-          "</user_information>",
-        ].join("\n"),
-      })
-    }
-
-    // ② <mcp_servers> — available MCP server info
-    {
-      const mcpLines: string[] = [
-        "<mcp_servers>",
-        "The Model Context Protocol (MCP) is a standard that connects AI systems with external tools and data sources.",
-        "MCP servers extend your capabilities by providing access to specialized functions, external information, and services.",
-        "The following MCP servers are available to you. Each server may provide (potentially truncated) additional recommendations and best practices.",
-      ]
-      if (parsed.mcpToolDefs && parsed.mcpToolDefs.length > 0) {
-        // Extract unique MCP server identifiers
-        const seenServers = new Set<string>()
-        for (const def of parsed.mcpToolDefs) {
-          if (
-            def.providerIdentifier &&
-            !seenServers.has(def.providerIdentifier)
-          ) {
-            seenServers.add(def.providerIdentifier)
-            mcpLines.push(`# ${def.providerIdentifier}`)
-          }
-        }
-      }
-      mcpLines.push("</mcp_servers>")
-      contextMessages.push({ role: "user", content: mcpLines.join("\n") })
-    }
-
-    // ③ <artifacts> — artifact directory path
-    {
-      // Use the conversation's artifact directory (matching Antigravity pattern)
-      const artifactDir = `${process.env.HOME || "/tmp"}/.gemini/antigravity/brain/${conversationId}`
-      contextMessages.push({
-        role: "user",
-        content: `<artifacts>\nArtifact Directory Path: ${artifactDir}\n</artifacts>`,
-      })
-    }
-
-    // ④ <user_rules> — user custom rules
-    if (parsed.cursorRules && parsed.cursorRules.length > 0) {
-      contextMessages.push({
-        role: "user",
-        content:
-          "<user_rules>\n" + parsed.cursorRules.join("\n") + "\n</user_rules>",
-      })
-    } else {
-      contextMessages.push({
-        role: "user",
-        content:
-          "<user_rules>\nThe user has not defined any custom rules.\n</user_rules>",
-      })
-    }
-
-    // ⑤ <workflows> — workflow definitions (+ Cursor Commands if any)
-    {
-      const wfLines: string[] = [
-        "<workflows>",
-        "You have the ability to use and create workflows, which are well-defined steps on how to achieve a particular thing. These workflows are defined as .md files in {.agents,.agent,_agents,_agent}/workflows.",
-        "The workflow files follow the following YAML frontmatter + markdown format:",
-        "---",
-        "description: [short title, e.g. how to deploy the application]",
-        "---",
-        "[specific steps on how to run this workflow]",
-        "",
-        " - You might be asked to create a new workflow. If so, create a new file in {.agents,.agent,_agents,_agent}/workflows/[filename].md (use absolute path) following the format described above. Be very specific with your instructions.",
-        " - If a workflow step has a '// turbo' annotation above it, you can auto-run the workflow step if it involves the run_command tool, by setting 'SafeToAutoRun' to true. This annotation ONLY applies for this single step.",
-        "   - For example if a workflow includes:",
-        "```",
-        "2. Make a folder called foo",
-        "// turbo",
-        "3. Make a folder called bar",
-        "```",
-        "You should auto-run step 3, but use your usual judgement for step 2.",
-        " - If a workflow has a '// turbo-all' annotation anywhere, you MUST auto-run EVERY step that involves the run_command tool, by setting 'SafeToAutoRun' to true. This annotation applies to EVERY step.",
-        " - If a workflow looks relevant, or the user explicitly uses a slash command like /slash-command, then use the view_file tool to read {.agents,.agent,_agents,_agent}/workflows/slash-command.md.",
-        "",
-      ]
-
-      // Inject user-defined Cursor Commands (/ slash commands) if available
-      if (parsed.cursorCommands && parsed.cursorCommands.length > 0) {
-        wfLines.push("The following user-defined commands are available:")
-        wfLines.push("")
-        for (const cmd of parsed.cursorCommands) {
-          wfLines.push(`### /${cmd.name}`)
-          wfLines.push(cmd.content)
-          wfLines.push("")
-        }
-      }
-
-      wfLines.push("</workflows>")
-      contextMessages.push({
-        role: "user",
-        content: wfLines.join("\n"),
-      })
-    }
-
-    // ⑥ <ADDITIONAL_METADATA> — IDE state metadata attached to user request
-    // NOTE: The actual user message content flows through the `messages` array
-    // (populated from Cursor conversation state). We only inject the metadata
-    // wrapper here to match Antigravity's temporal grounding and IDE state format.
-    {
-      const metadataLines: string[] = [
-        `Step Id: ${stepId++}`,
-        "",
-        "<ADDITIONAL_METADATA>",
-        `The current local time is: ${this.formatCurrentLocalTimeWithOffset()}. This is the latest source of truth for time; do not attempt to get the time any other way.`,
-        "",
-        "The user's current state is as follows:",
-      ]
-      // Active document from project context
-      if (parsed.codeChunks && parsed.codeChunks.length > 0) {
-        const activeDoc = parsed.codeChunks[0]
-        if (activeDoc) {
-          metadataLines.push(
-            `Active Document: ${activeDoc.path} (LANGUAGE_UNKNOWN)`
-          )
-          if (activeDoc.startLine !== undefined) {
-            metadataLines.push(`Cursor is on line: ${activeDoc.startLine}`)
-          }
-        }
-      }
-      metadataLines.push("No browser pages are currently open.")
-      metadataLines.push("</ADDITIONAL_METADATA>")
-
-      contextMessages.push({
-        role: "user",
-        content: metadataLines.join("\n"),
-      })
-    }
-
-    // ⑨ <EPHEMERAL_MESSAGE> — system-injected reminders
-    {
-      const ephLines: string[] = [
-        `Step Id: ${stepId++}`,
-        `The following is an <EPHEMERAL_MESSAGE> not actually sent by the user. It is provided by the system as a set of reminders and general important information to pay attention to. Do NOT respond to this message, just act accordingly.`,
-        "",
-        "<EPHEMERAL_MESSAGE>",
-        "<artifact_reminder>",
-        "You have not yet created any artifacts. Please follow the artifact guidelines and create them as needed based on the task.",
-        "CRITICAL REMINDER: remember that user-facing artifacts should be AS CONCISE AS POSSIBLE. Keep this in mind when editing artifacts.",
-        "</artifact_reminder>",
-        "<no_active_task_reminder>",
-        "You are currently not in a task because: a task boundary has never been set yet in this conversation.",
-        "If there is no obvious task from the user or if you are just conversing, then it is acceptable to not have a task set. If you are just handling simple one-off requests, such as explaining a single file, or making one or two ad-hoc code edit requests, or making an obvious refactoring request such as renaming or moving code into a helper function, it is also acceptable to not have a task set.",
-        "Otherwise, you should use the task_boundary tool to set a task if there is one evident.",
-        "Since you are NOT in an active task section, DO NOT call the `notify_user` tool unless you are requesting review of files.",
-        "</no_active_task_reminder>",
-        "</EPHEMERAL_MESSAGE>",
-      ]
-      contextMessages.push({ role: "user", content: ephLines.join("\n") })
-    }
+    const useGoogleContextMessages = this.isCloudCodeBackend(route.backend)
+    const contextMessages = useGoogleContextMessages
+      ? this.buildGoogleContextMessages(parsed, conversationId)
+      : []
+    const systemPrompt = useGoogleContextMessages
+      ? this.buildGoogleSystemPrompt(parsed)
+      : this.buildSystemPrompt(parsed)
 
     // Add tools in strict protocol order:
     // request supportedTools > session supportedTools > empty (no implicit defaults)
@@ -6097,13 +5936,13 @@ ${raw}
     const apiTools = buildToolsForApi(toolsToUse, { mcpToolDefs })
 
     // Apply truncation to stay within token limits
-    const contextTokens = this.truncator.countTokens(
-      contextMessages as UnifiedMessage[]
-    )
     const budget = this.resolveMessageBudget(route.backend, {
       parsed,
       session,
-      contextTokens,
+      contextTokens: contextMessages.length
+        ? this.truncator.countTokens(contextMessages as UnifiedMessage[])
+        : 0,
+      systemPrompt,
       toolDefinitions: apiTools,
     })
 
@@ -6142,10 +5981,10 @@ ${raw}
     }
 
     // Build Anthropic-style DTO
-    // Prepend context messages before conversation messages (matching Antigravity format)
     const dto: CreateMessageDto = {
       model: backendModel,
       messages: [...contextMessages, ...messages],
+      system: systemPrompt || undefined,
       max_tokens: budget.maxOutputTokens,
       stream: true,
     }
@@ -6804,8 +6643,19 @@ ${raw}
       const apiTools = buildToolsForApi(toolsToUse, {
         mcpToolDefs: session.mcpToolDefs,
       })
+      const useGoogleContextMessages = this.isCloudCodeBackend(route.backend)
+      const contextMessages = useGoogleContextMessages
+        ? this.buildGoogleContextMessages(session, conversationId)
+        : []
+      const systemPrompt = useGoogleContextMessages
+        ? this.buildGoogleSystemPrompt(session)
+        : this.buildSystemPrompt(session)
       const budget = this.resolveMessageBudget(route.backend, {
         session,
+        contextTokens: contextMessages.length
+          ? this.truncator.countTokens(contextMessages as UnifiedMessage[])
+          : 0,
+        systemPrompt,
         toolDefinitions: apiTools,
       })
 
@@ -6837,7 +6687,8 @@ ${raw}
 
       const dto: CreateMessageDto = {
         model: backendModel,
-        messages: truncatedShellMessages,
+        messages: [...contextMessages, ...truncatedShellMessages],
+        system: systemPrompt || undefined,
         max_tokens: budget.maxOutputTokens,
         stream: true,
         tools: apiTools,
@@ -7672,8 +7523,19 @@ ${raw}
     const continuationTools = buildToolsForApi(toolsForContinuation, {
       mcpToolDefs: session.mcpToolDefs,
     })
+    const useGoogleContextMessages = this.isCloudCodeBackend(route.backend)
+    const contextMessages = useGoogleContextMessages
+      ? this.buildGoogleContextMessages(session, conversationId)
+      : []
+    const systemPrompt = useGoogleContextMessages
+      ? this.buildGoogleSystemPrompt(session)
+      : this.buildSystemPrompt(session)
     const budget = this.resolveMessageBudget(route.backend, {
       session,
+      contextTokens: contextMessages.length
+        ? this.truncator.countTokens(contextMessages as UnifiedMessage[])
+        : 0,
+      systemPrompt,
       toolDefinitions: continuationTools,
     })
 
@@ -7707,7 +7569,8 @@ ${raw}
 
     const dto: CreateMessageDto = {
       model: backendModel,
-      messages: truncatedContinuationMessages,
+      messages: [...contextMessages, ...truncatedContinuationMessages],
+      system: systemPrompt || undefined,
       max_tokens: budget.maxOutputTokens,
       stream: true,
       tools: continuationTools,
@@ -8915,35 +8778,43 @@ ${raw}
   /**
    * Build system prompt from context
    */
-  private buildSystemPrompt(parsed: ParsedCursorRequest): string {
+  private buildSystemPrompt(context: PromptContext): string {
     const parts: string[] = []
 
-    // Custom system prompt 优先放最前面
-    if (parsed.customSystemPrompt) {
-      parts.push(parsed.customSystemPrompt)
+    if (context.customSystemPrompt) {
+      parts.push(context.customSystemPrompt)
     }
 
-    // Add cursor rules
-    if (parsed.cursorRules && parsed.cursorRules.length > 0) {
-      parts.push("Cursor Rules:\n" + parsed.cursorRules.join("\n"))
+    const cursorRulesSection = this.buildCursorRulesSection(context.cursorRules)
+    if (cursorRulesSection) {
+      parts.push(cursorRulesSection)
     }
 
-    // Add project context with clear workspace directory
-    if (parsed.projectContext) {
+    if (context.cursorCommands && context.cursorCommands.length > 0) {
+      const commandBlocks = context.cursorCommands.map((command) =>
+        [`/${command.name}`, command.content].join("\n")
+      )
+      parts.push("Selected Cursor Commands:\n" + commandBlocks.join("\n\n"))
+    }
+
+    if (context.explicitContext) {
+      parts.push("Explicit Context:\n" + context.explicitContext)
+    }
+
+    if (context.projectContext) {
       const workspaceInfo = [
-        `Current working directory: ${parsed.projectContext.rootPath}`,
+        `Current working directory: ${context.projectContext.rootPath}`,
       ]
-      if (parsed.projectContext.directories.length > 1) {
+      if (context.projectContext.directories.length > 1) {
         workspaceInfo.push(
-          `Open workspaces: ${parsed.projectContext.directories.join(", ")}`
+          `Open workspaces: ${context.projectContext.directories.join(", ")}`
         )
       }
       parts.push(workspaceInfo.join("\n"))
     }
 
-    // Add attached code chunks as context
-    if (parsed.codeChunks && parsed.codeChunks.length > 0) {
-      const chunkTexts = parsed.codeChunks.map((chunk) => {
+    if (context.codeChunks && context.codeChunks.length > 0) {
+      const chunkTexts = context.codeChunks.map((chunk) => {
         const lineInfo = chunk.startLine
           ? `:${chunk.startLine}-${chunk.endLine}`
           : ""
@@ -8953,6 +8824,287 @@ ${raw}
     }
 
     return parts.join("\n\n")
+  }
+
+  private buildGoogleSystemPrompt(context: PromptContext): string {
+    const parts: string[] = []
+    if (context.customSystemPrompt) {
+      parts.push(context.customSystemPrompt)
+    }
+    if (context.explicitContext) {
+      parts.push("Explicit Context:\n" + context.explicitContext)
+    }
+    return parts.join("\n\n")
+  }
+
+  private buildGoogleContextMessages(
+    context: PromptContext,
+    conversationId: string
+  ): Array<{ role: "user" | "assistant"; content: MessageContent }> {
+    const contextMessages: Array<{
+      role: "user" | "assistant"
+      content: MessageContent
+    }> = []
+    let stepId = 0
+
+    if (context.projectContext) {
+      const workspaceMappings = context.projectContext.directories
+        .map((dir) => `${dir} -> ${dir.split("/").slice(-2).join("/")}`)
+        .join("\n")
+      contextMessages.push({
+        role: "user",
+        content: [
+          "<user_information>",
+          "The USER's OS version is mac.",
+          `The user has ${context.projectContext.directories.length} active workspaces, each defined by a URI and a CorpusName. Multiple URIs potentially map to the same CorpusName. The mapping is shown as follows in the format [URI] -> [CorpusName]:`,
+          workspaceMappings,
+          "Code relating to the user's requests should be written in the locations listed above. Avoid writing project code files to tmp, in the .gemini dir, or directly to the Desktop and similar folders unless explicitly asked.",
+          "</user_information>",
+        ].join("\n"),
+      })
+    }
+
+    {
+      const mcpLines: string[] = [
+        "<mcp_servers>",
+        "The Model Context Protocol (MCP) is a standard that connects AI systems with external tools and data sources.",
+        "MCP servers extend your capabilities by providing access to specialized functions, external information, and services.",
+        "The following MCP servers are available to you. Each server may provide (potentially truncated) additional recommendations and best practices.",
+      ]
+      if (context.mcpToolDefs && context.mcpToolDefs.length > 0) {
+        const seenServers = new Set<string>()
+        for (const def of context.mcpToolDefs) {
+          if (
+            def.providerIdentifier &&
+            !seenServers.has(def.providerIdentifier)
+          ) {
+            seenServers.add(def.providerIdentifier)
+            mcpLines.push(`# ${def.providerIdentifier}`)
+          }
+        }
+      }
+      mcpLines.push("</mcp_servers>")
+      contextMessages.push({ role: "user", content: mcpLines.join("\n") })
+    }
+
+    {
+      const artifactDir = `${process.env.HOME || "/tmp"}/.gemini/antigravity/brain/${conversationId}`
+      contextMessages.push({
+        role: "user",
+        content: `<artifacts>\nArtifact Directory Path: ${artifactDir}\n</artifacts>`,
+      })
+    }
+
+    if (context.cursorRules && context.cursorRules.length > 0) {
+      const ruleContents = context.cursorRules
+        .map((rule) => (typeof rule === "string" ? rule : rule.content))
+        .filter((content) => typeof content === "string" && content.trim())
+      if (ruleContents.length > 0) {
+        contextMessages.push({
+          role: "user",
+          content:
+            "<user_rules>\n" + ruleContents.join("\n") + "\n</user_rules>",
+        })
+      }
+    } else {
+      contextMessages.push({
+        role: "user",
+        content:
+          "<user_rules>\nThe user has not defined any custom rules.\n</user_rules>",
+      })
+    }
+
+    {
+      const wfLines: string[] = [
+        "<workflows>",
+        "You have the ability to use and create workflows, which are well-defined steps on how to achieve a particular thing. These workflows are defined as .md files in {.agents,.agent,_agents,_agent}/workflows.",
+        "The workflow files follow the following YAML frontmatter + markdown format:",
+        "---",
+        "description: [short title, e.g. how to deploy the application]",
+        "---",
+        "[specific steps on how to run this workflow]",
+        "",
+        " - You might be asked to create a new workflow. If so, create a new file in {.agents,.agent,_agents,_agent}/workflows/[filename].md (use absolute path) following the format described above. Be very specific with your instructions.",
+        " - If a workflow step has a '// turbo' annotation above it, you can auto-run the workflow step if it involves the run_command tool, by setting 'SafeToAutoRun' to true. This annotation ONLY applies for this single step.",
+        "   - For example if a workflow includes:",
+        "```",
+        "2. Make a folder called foo",
+        "// turbo",
+        "3. Make a folder called bar",
+        "```",
+        "You should auto-run step 3, but use your usual judgement for step 2.",
+        " - If a workflow has a '// turbo-all' annotation anywhere, you MUST auto-run EVERY step that involves the run_command tool, by setting 'SafeToAutoRun' to true. This annotation applies to EVERY step.",
+        " - If a workflow looks relevant, or the user explicitly uses a slash command like /slash-command, then use the view_file tool to read {.agents,.agent,_agents,_agent}/workflows/slash-command.md.",
+        "",
+      ]
+
+      if (context.cursorCommands && context.cursorCommands.length > 0) {
+        wfLines.push("The following user-defined commands are available:")
+        wfLines.push("")
+        for (const cmd of context.cursorCommands) {
+          wfLines.push(`### /${cmd.name}`)
+          wfLines.push(cmd.content)
+          wfLines.push("")
+        }
+      }
+
+      wfLines.push("</workflows>")
+      contextMessages.push({
+        role: "user",
+        content: wfLines.join("\n"),
+      })
+    }
+
+    {
+      const metadataLines: string[] = [
+        `Step Id: ${stepId++}`,
+        "",
+        "<ADDITIONAL_METADATA>",
+        `The current local time is: ${this.formatCurrentLocalTimeWithOffset()}. This is the latest source of truth for time; do not attempt to get the time any other way.`,
+        "",
+        "The user's current state is as follows:",
+      ]
+      if (context.codeChunks && context.codeChunks.length > 0) {
+        const activeDoc = context.codeChunks[0]
+        if (activeDoc) {
+          metadataLines.push(
+            `Active Document: ${activeDoc.path} (LANGUAGE_UNKNOWN)`
+          )
+          if (activeDoc.startLine !== undefined) {
+            metadataLines.push(`Cursor is on line: ${activeDoc.startLine}`)
+          }
+        }
+      }
+      metadataLines.push("No browser pages are currently open.")
+      metadataLines.push("</ADDITIONAL_METADATA>")
+
+      contextMessages.push({
+        role: "user",
+        content: metadataLines.join("\n"),
+      })
+    }
+
+    {
+      const ephLines: string[] = [
+        `Step Id: ${stepId++}`,
+        "The following is an <EPHEMERAL_MESSAGE> not actually sent by the user. It is provided by the system as a set of reminders and general important information to pay attention to. Do NOT respond to this message, just act accordingly.",
+        "",
+        "<EPHEMERAL_MESSAGE>",
+        "<artifact_reminder>",
+        "You have not yet created any artifacts. Please follow the artifact guidelines and create them as needed based on the task.",
+        "CRITICAL REMINDER: remember that user-facing artifacts should be AS CONCISE AS POSSIBLE. Keep this in mind when editing artifacts.",
+        "</artifact_reminder>",
+        "<no_active_task_reminder>",
+        "You are currently not in a task because: a task boundary has never been set yet in this conversation.",
+        "If there is no obvious task from the user or if you are just conversing, then it is acceptable to not have a task set. If you are just handling simple one-off requests, such as explaining a single file, or making one or two ad-hoc code edit requests, or making an obvious refactoring request such as renaming or moving code into a helper function, it is also acceptable to not have a task set.",
+        "Otherwise, you should use the task_boundary tool to set a task if there is one evident.",
+        "Since you are NOT in an active task section, DO NOT call the `notify_user` tool unless you are requesting review of files.",
+        "</no_active_task_reminder>",
+        "</EPHEMERAL_MESSAGE>",
+      ]
+      contextMessages.push({ role: "user", content: ephLines.join("\n") })
+    }
+
+    return contextMessages
+  }
+
+  private buildCursorRulesSection(
+    rules?: PromptContext["cursorRules"] | string[]
+  ): string | null {
+    if (!Array.isArray(rules) || rules.length === 0) {
+      return null
+    }
+
+    const renderedRules = rules.map((rule, index) =>
+      this.formatCursorRule(rule, index)
+    )
+    return "Cursor Rules:\n" + renderedRules.join("\n\n")
+  }
+
+  private formatCursorRule(rule: CursorRule | string, index: number): string {
+    if (typeof rule === "string") {
+      return [`[Rule ${index + 1}]`, "content:", rule].join("\n")
+    }
+
+    const lines = [`[Rule ${index + 1}]`]
+
+    if (rule.fullPath) {
+      lines.push(`full_path: ${rule.fullPath}`)
+    }
+
+    const ruleType = this.getCursorRuleTypeLabel(rule)
+    if (ruleType) {
+      lines.push(`type: ${ruleType}`)
+    }
+
+    const ruleSource = this.getCursorRuleSourceLabel(rule.source)
+    if (ruleSource) {
+      lines.push(`source: ${ruleSource}`)
+    }
+
+    const typeCase = rule.type?.type.case
+    if (typeCase === "fileGlobbed" && rule.type?.type.value.globs.length) {
+      lines.push(`globs: ${rule.type.type.value.globs.join(", ")}`)
+    }
+    if (
+      typeCase === "agentFetched" &&
+      rule.type?.type.value.description.trim()
+    ) {
+      lines.push(`description: ${rule.type.type.value.description.trim()}`)
+    }
+    if (rule.environments.length > 0) {
+      lines.push(`environments: ${rule.environments.join(", ")}`)
+    }
+    if (rule.disabledEnvironments.length > 0) {
+      lines.push(
+        `disabled_environments: ${rule.disabledEnvironments.join(", ")}`
+      )
+    }
+    if (rule.gitRemoteOrigin) {
+      lines.push(`git_remote_origin: ${rule.gitRemoteOrigin}`)
+    }
+    if (rule.plugin) {
+      lines.push(`plugin: ${rule.plugin}`)
+    }
+    if (rule.marketplace) {
+      lines.push(`marketplace: ${rule.marketplace}`)
+    }
+    if (rule.parseError) {
+      lines.push(`parse_error: ${rule.parseError}`)
+    }
+
+    lines.push("content:")
+    lines.push(rule.content || "")
+
+    return lines.join("\n")
+  }
+
+  private getCursorRuleTypeLabel(rule: CursorRule): string | null {
+    switch (rule.type?.type.case) {
+      case "global":
+        return "global"
+      case "fileGlobbed":
+        return "file_globbed"
+      case "agentFetched":
+        return "agent_fetched"
+      case "manuallyAttached":
+        return "manually_attached"
+      default:
+        return null
+    }
+  }
+
+  private getCursorRuleSourceLabel(
+    source: CursorRule["source"]
+  ): string | null {
+    switch (source) {
+      case CursorRuleSource.TEAM:
+        return "team"
+      case CursorRuleSource.USER:
+        return "user"
+      default:
+        return null
+    }
   }
 
   private formatCurrentLocalTimeWithOffset(): string {

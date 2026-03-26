@@ -7,6 +7,7 @@ import {
   AgentClientMessageSchema,
   AgentRunRequest,
   ConversationStateStructure,
+  type CursorRule,
   ExecClientControlMessage,
   ExecClientMessage,
   ExecClientMessageSchema,
@@ -112,8 +113,8 @@ export interface ParsedCursorRequest {
     endLine?: number
   }>
 
-  // Cursor 规则
-  cursorRules?: string[]
+  // Cursor 规则（保留协议原始结构，避免在解析阶段丢失元数据）
+  cursorRules?: CursorRule[]
 
   // Cursor Commands (/ 命令 — 用户定义的可复用工作流)
   cursorCommands?: Array<{ name: string; content: string }>
@@ -795,12 +796,10 @@ export class CursorRequestParser {
     }
 
     // 提取 Cursor Rules
-    const cursorRules: string[] = []
+    const cursorRules: CursorRule[] = []
     if (requestContext?.rules?.length) {
       for (const rule of requestContext.rules) {
-        if (rule.content) {
-          cursorRules.push(rule.content)
-        }
+        cursorRules.push(rule)
       }
     }
 
@@ -852,17 +851,15 @@ export class CursorRequestParser {
     }
 
     // 提取支持的工具
-    // MCP tools are request-scoped dynamic definitions. Built-in Cursor tools are
-    // protocol/runtime capabilities and should be reconstructed from known
-    // built-in catalog plus request capability flags rather than inferred from
-    // requestContext.tools (which only carries MCP definitions).
-    const supportedToolsSet = new Set<string>(
-      getDefaultAgentToolNames({
-        webSearchEnabled: requestContext?.webSearchEnabled,
-        webFetchEnabled: requestContext?.webFetchEnabled,
-        readLintsEnabled: requestContext?.readLintsEnabled,
-      })
-    )
+    // RequestContext.tools / mcp_tools 只承载 MCP 定义；内置 Cursor 工具需要结合
+    // capability flags 和 customSubagents[].tools 一起判断，避免把显式工具选择扩回默认全集。
+    const defaultBuiltInTools = getDefaultAgentToolNames({
+      webSearchEnabled: requestContext?.webSearchEnabled,
+      webFetchEnabled: requestContext?.webFetchEnabled,
+      readLintsEnabled: requestContext?.readLintsEnabled,
+    })
+    const defaultBuiltInToolSet = new Set(defaultBuiltInTools)
+    const supportedToolsSet = new Set<string>()
 
     const appendDeclaredMcpToolName = (tool: {
       name?: string
@@ -887,6 +884,31 @@ export class CursorRequestParser {
     if (req.mcpTools?.mcpTools?.length) {
       for (const tool of req.mcpTools.mcpTools) {
         appendDeclaredMcpToolName(tool)
+      }
+    }
+
+    if (requestContext?.customSubagents?.length) {
+      for (const subagent of requestContext.customSubagents) {
+        if (!subagent.tools?.length) continue
+        for (const toolName of subagent.tools) {
+          if (toolName) {
+            supportedToolsSet.add(toolName)
+          }
+        }
+      }
+    }
+
+    const hasBuiltInCursorTools = Array.from(supportedToolsSet).some((name) =>
+      defaultBuiltInToolSet.has(name)
+    )
+    const hasExplicitCustomSubagentToolSelection =
+      requestContext?.customSubagents?.some(
+        (subagent) => !!subagent.tools?.length
+      ) ?? false
+
+    if (!hasBuiltInCursorTools && !hasExplicitCustomSubagentToolSelection) {
+      for (const toolName of defaultBuiltInTools) {
+        supportedToolsSet.add(toolName)
       }
     }
 

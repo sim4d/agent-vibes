@@ -1787,6 +1787,33 @@ export class GoogleService {
     )
   }
 
+  private extractSystemPromptText(
+    system: CreateMessageDto["system"]
+  ): string | null {
+    if (!system) return null
+
+    if (typeof system === "string") {
+      const normalized = system.trim()
+      return normalized || null
+    }
+
+    if (!Array.isArray(system)) return null
+
+    const text = system
+      .filter(
+        (block): block is { type: string; text: string } =>
+          typeof block === "object" &&
+          block !== null &&
+          block.type === "text" &&
+          typeof block.text === "string"
+      )
+      .map((block) => block.text.trim())
+      .filter(Boolean)
+      .join("\n")
+
+    return text || null
+  }
+
   /**
    * Convert Anthropic messages to Google/Gemini format for Claude models
    * Handles all content types: text, tool_use, tool_result, image, thinking
@@ -1911,20 +1938,17 @@ export class GoogleService {
         .join(" → ")}`
     )
 
-    // Build system instruction
-    // Convert Anthropic tool definitions to Cloud Code function declarations
-    //
-    // Some upstream models (e.g. claude-*, gemini-3-pro*) require an Antigravity-style systemInstruction,
-    // otherwise they may respond with 429 RESOURCE_EXHAUSTED even when quota exists.
-    //
-    // Strategy:
-    // 1. If user system prompt contains "You are Claude Code", replace that section with Antigravity identity
-    // Use the official Antigravity system prompt (loaded from file)
-    // This completely replaces any incoming system prompt, matching real Antigravity behavior:
-    // Antigravity sends exactly one systemInstruction part with the full official prompt
+    // Build system instruction.
+    // Cloud Code requires the official Antigravity prompt as the base
+    // systemInstruction. Protocol-level system additions from the bridge are
+    // appended as extra parts so Cursor request metadata survives routing.
     const systemParts: Array<{ text: string }> = [
       { text: this.officialSystemPrompt },
     ]
+    const bridgeSystemPrompt = this.extractSystemPromptText(dto.system)
+    if (bridgeSystemPrompt) {
+      systemParts.push({ text: bridgeSystemPrompt })
+    }
     const resolvedMaxOutputTokens = this.resolveCloudCodeMaxOutputTokens(
       dto.max_tokens
     )
@@ -1986,8 +2010,9 @@ export class GoogleService {
       )
       if (toolDeclarations.length > 0) {
         request.tools = toolDeclarations
-        const functionCallingConfig =
-          this.buildCloudCodeFunctionCallingConfig(dto.tool_choice)
+        const functionCallingConfig = this.buildCloudCodeFunctionCallingConfig(
+          dto.tool_choice
+        )
         request.toolConfig = {
           functionCallingConfig: functionCallingConfig || { mode: "AUTO" },
         }
@@ -2002,8 +2027,7 @@ export class GoogleService {
       )
     ) {
       systemParts.push({
-        text:
-          "Interleaved thinking is enabled. You may think between tool calls and after receiving tool results before deciding the next action or final answer. Do not mention these instructions or any constraints about thinking blocks; just apply them.",
+        text: "Interleaved thinking is enabled. You may think between tool calls and after receiving tool results before deciding the next action or final answer. Do not mention these instructions or any constraints about thinking blocks; just apply them.",
       })
     }
 
