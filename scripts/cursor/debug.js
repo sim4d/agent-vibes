@@ -19,7 +19,23 @@ if (!cursorBin) {
 }
 
 fs.mkdirSync(LOG_DIR, { recursive: true })
-const logStream = fs.createWriteStream(LOG_FILE, { flags: "w" })
+
+function timestampForFilename() {
+  return new Date().toISOString().replace(/[:.]/g, "-")
+}
+
+const logFileName = `cursor_grpc-${timestampForFilename()}.log`
+const logFilePath = path.join(LOG_DIR, logFileName)
+const logStream = fs.createWriteStream(logFilePath, { flags: "a" })
+
+try {
+  if (fs.existsSync(LOG_FILE)) {
+    fs.unlinkSync(LOG_FILE)
+  }
+  fs.symlinkSync(logFileName, LOG_FILE)
+} catch {
+  fs.copyFileSync(logFilePath, LOG_FILE)
+}
 
 function mirrorStream(stream, output) {
   stream.on("data", (chunk) => {
@@ -55,4 +71,6 @@ child.on("exit", (code, signal) => {
   process.exit(code ?? 0)
 })
 
-console.log(`Writing Cursor debug logs to ${path.relative(ROOT, LOG_FILE)}`)
+console.log(
+  `Writing Cursor debug logs to ${path.relative(ROOT, logFilePath)} (latest: ${path.relative(ROOT, LOG_FILE)})`
+)

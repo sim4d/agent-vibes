@@ -18,20 +18,22 @@ async function bootstrap() {
   // always has logs to collect, without requiring manual `| tee`.
   const logDir = path.join(__dirname, "..", "..", "..", ".log")
   fs.mkdirSync(logDir, { recursive: true })
-  const logFilePath = path.join(logDir, "protocol-bridge.log")
 
-  // Rotate: truncate if larger than 10 MB
-  const MAX_LOG_SIZE = 10 * 1024 * 1024
-  try {
-    const stat = fs.statSync(logFilePath)
-    if (stat.size > MAX_LOG_SIZE) {
-      fs.writeFileSync(logFilePath, "")
-    }
-  } catch {
-    // File doesn't exist yet, that's fine
-  }
+  const timestampForFilename = () =>
+    new Date().toISOString().replace(/[:.]/g, "-")
+  const logFileName = `protocol-bridge-${timestampForFilename()}.log`
+  const logFilePath = path.join(logDir, logFileName)
+  const latestLogPath = path.join(logDir, "protocol-bridge.log")
 
   const logStream = fs.createWriteStream(logFilePath, { flags: "a" })
+  try {
+    if (fs.existsSync(latestLogPath)) {
+      fs.unlinkSync(latestLogPath)
+    }
+    fs.symlinkSync(logFileName, latestLogPath)
+  } catch {
+    fs.copyFileSync(logFilePath, latestLogPath)
+  }
   const timestamp = () => new Date().toISOString()
 
   // Write startup marker
