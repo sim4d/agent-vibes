@@ -43,6 +43,7 @@ import {
 import { ClientSideToolV2ExecutorService } from "./client-side-tool-v2-executor.service"
 import { CursorGrpcService } from "./cursor-grpc.service"
 import {
+  type AttachedImage,
   cursorRequestParser,
   ParsedCursorRequest,
   ParsedToolResult,
@@ -822,6 +823,50 @@ export class CursorConnectStreamService {
     }
 
     return null
+  }
+
+  /**
+   * Build user message content: plain text or multimodal (text + images).
+   * Returns string if no images, or Anthropic-format content block array.
+   */
+  private buildUserContentWithImages(
+    text: string,
+    images?: AttachedImage[]
+  ): MessageContent {
+    if (!images || images.length === 0) {
+      return text
+    }
+
+    const blocks: Array<{ type: string; [key: string]: unknown }> = []
+    if (text) {
+      blocks.push({ type: "text", text })
+    }
+    blocks.push(
+      ...images.map((img) => ({
+        type: "image" as const,
+        source: {
+          type: "base64" as const,
+          media_type: img.mimeType,
+          data: img.data,
+        },
+      }))
+    )
+    return blocks
+  }
+
+  private messageContentsEqual(
+    left: MessageContent | undefined,
+    right: MessageContent
+  ): boolean {
+    if (typeof left === "string" || typeof right === "string") {
+      return left === right
+    }
+
+    if (!Array.isArray(left) || !Array.isArray(right)) {
+      return false
+    }
+
+    return JSON.stringify(left) === JSON.stringify(right)
   }
 
   private hasStructuredToolContent(
@@ -5881,25 +5926,21 @@ ${raw}
       // CRITICAL: Append the new user message from this turn to session history
       // Without this, the new message only exists in parsed.conversation
       // and the model would never see it
-      if (parsed.newMessage) {
+      if (parsed.newMessage || parsed.attachedImages?.length) {
         const last = session.messages[session.messages.length - 1]
-        const lastText =
-          typeof last?.content === "string"
-            ? last.content
-            : this.extractLatestUserPlainText(
-                [last].filter(Boolean) as Array<{
-                  role: "user" | "assistant"
-                  content: MessageContent
-                }>
-              )
-        if (!(last?.role === "user" && lastText === parsed.newMessage)) {
-          this.sessionManager.addMessage(
-            conversationId,
-            "user",
-            parsed.newMessage
+        const userContent = this.buildUserContentWithImages(
+          parsed.newMessage,
+          parsed.attachedImages
+        )
+        if (
+          !(
+            last?.role === "user" &&
+            this.messageContentsEqual(last.content, userContent)
           )
+        ) {
+          this.sessionManager.addMessage(conversationId, "user", userContent)
           this.logger.debug(
-            `Appended new user message to session (${parsed.newMessage.length} chars)`
+            `Appended new user message to session (${parsed.newMessage.length} chars${parsed.attachedImages?.length ? `, ${parsed.attachedImages.length} image(s)` : ""})`
           )
         } else {
           this.logger.debug(
@@ -5913,10 +5954,26 @@ ${raw}
       )
     } else {
       // First turn: use parsed conversation
-      rawMessages = parsed.conversation.map((msg) => ({
-        role: msg.role,
-        content: msg.content,
-      }))
+      rawMessages = parsed.conversation.map((msg, idx) => {
+        // For the last user message, attach images if present
+        if (
+          idx === parsed.conversation.length - 1 &&
+          msg.role === "user" &&
+          parsed.attachedImages?.length
+        ) {
+          return {
+            role: msg.role,
+            content: this.buildUserContentWithImages(
+              msg.content,
+              parsed.attachedImages
+            ),
+          }
+        }
+        return {
+          role: msg.role,
+          content: msg.content,
+        }
+      })
       this.logger.debug(
         `First turn: using ${rawMessages.length} message(s) from request`
       )

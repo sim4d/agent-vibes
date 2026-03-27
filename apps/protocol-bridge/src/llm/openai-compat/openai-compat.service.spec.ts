@@ -8,6 +8,17 @@ type OpenaiCompatStreamHarness = OpenaiCompatService & {
   baseUrl: string
   responsesApiMode: "auto" | "always" | "never"
   resolveEndpoint(model: string): "responses" | "chat-completions"
+  translateRequest(
+    dto: CreateMessageDto,
+    stream: boolean
+  ): {
+    messages: Array<{
+      role: string
+      content?:
+        | string
+        | Array<{ type: string; text?: string; image_url?: { url: string } }>
+    }>
+  }
   sendClaudeMessageStreamViaChatCompletions(
     dto: CreateMessageDto
   ): AsyncGenerator<string, void, unknown>
@@ -106,5 +117,45 @@ describe("OpenaiCompatService stream fallback", () => {
 
     expect(seen).toEqual(["partial-responses-event"])
     expect(chatSpy).not.toHaveBeenCalled()
+  })
+
+  it("translates Anthropic image blocks into OpenAI vision content", () => {
+    const harness = createService() as OpenaiCompatStreamHarness
+
+    const request = harness.translateRequest(
+      {
+        model: "gpt-5",
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "what is in this image?" },
+              {
+                type: "image",
+                source: {
+                  type: "base64",
+                  media_type: "image/png",
+                  data: "AQID",
+                },
+              },
+            ],
+          },
+        ],
+      },
+      false
+    )
+
+    expect(request.messages).toEqual([
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "what is in this image?" },
+          {
+            type: "image_url",
+            image_url: { url: "data:image/png;base64,AQID" },
+          },
+        ],
+      },
+    ])
   })
 })

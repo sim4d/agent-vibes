@@ -10,6 +10,31 @@ import { enforceToolProtocol } from "../../context/message-integrity-guard"
  */
 type MessageContent = string | Array<{ type: string; [key: string]: unknown }>
 
+function buildUserMessageContent(
+  text: string,
+  images?: ParsedCursorRequest["attachedImages"]
+): MessageContent {
+  if (!images?.length) {
+    return text
+  }
+
+  const blocks: Array<{ type: string; [key: string]: unknown }> = []
+  if (text) {
+    blocks.push({ type: "text", text })
+  }
+  for (const image of images) {
+    blocks.push({
+      type: "image",
+      source: {
+        type: "base64",
+        media_type: image.mimeType,
+        data: image.data,
+      },
+    })
+  }
+  return blocks
+}
+
 export type SessionTodoStatus =
   | "pending"
   | "in_progress"
@@ -801,7 +826,24 @@ export class ChatSessionManager implements OnModuleDestroy {
   ): ChatSession {
     return {
       conversationId,
-      messages: initialRequest?.conversation || [],
+      messages:
+        initialRequest?.conversation.map((message, index, conversation) => {
+          if (
+            index === conversation.length - 1 &&
+            message.role === "user" &&
+            initialRequest.attachedImages?.length
+          ) {
+            return {
+              role: message.role,
+              content: buildUserMessageContent(
+                message.content,
+                initialRequest.attachedImages
+              ),
+            }
+          }
+
+          return message
+        }) || [],
       model: initialRequest?.model || "claude-sonnet-4.5",
       thinkingLevel: initialRequest?.thinkingLevel || 0,
       isAgentic: initialRequest?.isAgentic || false,

@@ -74,6 +74,17 @@ export interface McpToolDef {
   inputSchema?: Record<string, unknown>
 }
 
+// Cursor 协议中附加的图片数据（从 SelectedImage 解析）
+export interface AttachedImage {
+  /** Base64 encoded image data */
+  data: string
+  /** MIME type, e.g. "image/png" */
+  mimeType: string
+  /** Optional dimensions */
+  width?: number
+  height?: number
+}
+
 // 已解析的请求结构（保持与旧版相同的接口约定）
 export interface ParsedCursorRequest {
   // 对话历史
@@ -133,6 +144,9 @@ export interface ParsedCursorRequest {
 
   // 显式上下文
   explicitContext?: string
+
+  // 附加图片（从 selectedContext.selectedImages 解析）
+  attachedImages?: AttachedImage[]
 
   // 客户端 Tool 结果
   toolResults?: ParsedToolResult[]
@@ -709,10 +723,51 @@ export class CursorRequestParser {
       req.conversationState
     )
 
+    // 附加图片
+    const attachedImages: AttachedImage[] = []
+
     if (action && actionCase === "userMessageAction") {
       const userMsg: UserMessage | undefined = action.action.value.userMessage
       if (userMsg) {
         prompt = userMsg.text
+
+        // 提取 selectedContext.selectedImages 中的图片数据
+        if (userMsg.selectedContext?.selectedImages?.length) {
+          for (const img of userMsg.selectedContext.selectedImages) {
+            const mimeType = img.mimeType || "image/png"
+            let rawBytes: Uint8Array | undefined
+
+            switch (img.dataOrBlobId.case) {
+              case "data":
+                rawBytes = img.dataOrBlobId.value
+                break
+              case "blobIdWithData":
+                rawBytes = img.dataOrBlobId.value.data
+                break
+              case "blobId":
+                // blobId-only: data not inline, would need KV store lookup
+                this.logger.warn(
+                  `Image with blobId-only not supported yet (uuid=${img.uuid})`
+                )
+                break
+            }
+
+            if (rawBytes && rawBytes.length > 0) {
+              attachedImages.push({
+                data: Buffer.from(rawBytes).toString("base64"),
+                mimeType,
+                width: img.dimension?.width,
+                height: img.dimension?.height,
+              })
+            }
+          }
+
+          if (attachedImages.length > 0) {
+            this.logger.log(
+              `Extracted ${attachedImages.length} image(s) from selectedContext (total ${attachedImages.reduce((sum, img) => sum + img.data.length, 0)} base64 chars)`
+            )
+          }
+        }
       }
       // 提取 requestContext（包含 workspace、rules 等信息）
       requestContext = action.action.value.requestContext
@@ -1008,7 +1063,9 @@ export class CursorRequestParser {
       )
     }
 
-    if (!prompt) {
+    const hasUserInput = prompt.length > 0 || attachedImages.length > 0
+
+    if (!hasUserInput) {
       if (actionCase === "resumeAction") {
         this.logger.log(
           `AgentRunRequest resumeAction: conversationId=${conversationId || "(none)"}, pendingToolCalls=${req.conversationState?.pendingToolCalls?.length || 0}`
@@ -1047,7 +1104,14 @@ export class CursorRequestParser {
 
     const conversation = [...stateHistory]
     const tail = conversation[conversation.length - 1]
-    if (!(tail && tail.role === "user" && tail.content === prompt)) {
+    if (
+      !(
+        tail &&
+        tail.role === "user" &&
+        tail.content === prompt &&
+        !(prompt.length === 0 && attachedImages.length > 0)
+      )
+    ) {
       conversation.push({ role: "user", content: prompt })
     }
 
@@ -1072,6 +1136,7 @@ export class CursorRequestParser {
       requestedMaxOutputTokens,
       requestedModelParameters,
       mcpToolDefs: mcpToolDefs.length > 0 ? mcpToolDefs : undefined,
+      attachedImages: attachedImages.length > 0 ? attachedImages : undefined,
     }
   }
 

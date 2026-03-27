@@ -339,6 +339,7 @@ export class OpenaiCompatService implements OnModuleInit {
 
       // Separate text/image, tool_use, and tool_result blocks
       const textParts: string[] = []
+      const imageParts: Array<{ type: string; image_url: { url: string } }> = []
       const toolCalls: ChatCompletionToolCall[] = []
       const toolResults: ChatCompletionMessage[] = []
 
@@ -354,12 +355,14 @@ export class OpenaiCompatService implements OnModuleInit {
               const data = source.data || source.base64
               if (data) {
                 const mediaType =
-                  source.media_type ||
-                  source.mime_type ||
-                  "application/octet-stream"
-                // For image content, we'll include it as text description
-                // since not all OpenAI-compatible APIs support vision
-                textParts.push(`[Image: ${mediaType}]`)
+                  source.media_type || source.mime_type || "image/png"
+                // Use OpenAI vision format with data URI
+                imageParts.push({
+                  type: "image_url",
+                  image_url: {
+                    url: `data:${mediaType};base64,${data}`,
+                  },
+                })
               }
             }
             break
@@ -413,6 +416,18 @@ export class OpenaiCompatService implements OnModuleInit {
           assistantMsg.content = textParts.join("\n")
         }
         messages.push(assistantMsg)
+      } else if (imageParts.length > 0) {
+        // Multimodal content: text + images in OpenAI vision format
+        const contentArray: Array<{
+          type: string
+          text?: string
+          image_url?: { url: string }
+        }> = []
+        if (textParts.length > 0) {
+          contentArray.push({ type: "text", text: textParts.join("\n") })
+        }
+        contentArray.push(...imageParts)
+        messages.push({ role, content: contentArray })
       } else if (textParts.length > 0) {
         messages.push({ role, content: textParts.join("\n") })
       } else if (role === "assistant") {
