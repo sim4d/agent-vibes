@@ -135,6 +135,144 @@ function resolveOpenAiCompatReasoningEffort(dto: CreateMessageDto): string {
   }
 }
 
+const THINKING_OPEN_TAG = "<thinking>"
+const THINKING_CLOSE_TAG = "</thinking>"
+
+export interface ThinkingTagStreamState {
+  inThinking: boolean
+  pending: string
+}
+
+export type ThinkingTagStreamEvent =
+  | { type: "text"; text: string }
+  | { type: "thinking"; text: string }
+  | { type: "thinking_end" }
+
+export function createThinkingTagStreamState(): ThinkingTagStreamState {
+  return {
+    inThinking: false,
+    pending: "",
+  }
+}
+
+function longestTagPrefixSuffix(text: string, tags: string[]): number {
+  const maxLen = Math.min(
+    text.length,
+    Math.max(...tags.map((tag) => tag.length - 1), 0)
+  )
+
+  for (let len = maxLen; len > 0; len--) {
+    const suffix = text.slice(-len)
+    if (tags.some((tag) => tag.startsWith(suffix))) {
+      return len
+    }
+  }
+
+  return 0
+}
+
+export function consumeThinkingTagTextDelta(
+  state: ThinkingTagStreamState,
+  delta: string
+): ThinkingTagStreamEvent[] {
+  if (!delta) return []
+
+  const events: ThinkingTagStreamEvent[] = []
+  let remaining = state.pending + delta
+  state.pending = ""
+
+  while (remaining.length > 0) {
+    if (state.inThinking) {
+      const closeIdx = remaining.indexOf(THINKING_CLOSE_TAG)
+      if (closeIdx === -1) {
+        const pendingLen = longestTagPrefixSuffix(remaining, [
+          THINKING_CLOSE_TAG,
+        ])
+        const thinkingText = remaining.slice(0, remaining.length - pendingLen)
+        if (thinkingText) {
+          events.push({ type: "thinking", text: thinkingText })
+        }
+        state.pending = remaining.slice(remaining.length - pendingLen)
+        return events
+      }
+
+      const thinkingText = remaining.slice(0, closeIdx)
+      if (thinkingText) {
+        events.push({ type: "thinking", text: thinkingText })
+      }
+      events.push({ type: "thinking_end" })
+      state.inThinking = false
+      remaining = remaining.slice(closeIdx + THINKING_CLOSE_TAG.length)
+      continue
+    }
+
+    const openIdx = remaining.indexOf(THINKING_OPEN_TAG)
+    if (openIdx === -1) {
+      const pendingLen = longestTagPrefixSuffix(remaining, [THINKING_OPEN_TAG])
+      const text = remaining.slice(0, remaining.length - pendingLen)
+      if (text) {
+        events.push({ type: "text", text })
+      }
+      state.pending = remaining.slice(remaining.length - pendingLen)
+      return events
+    }
+
+    const text = remaining.slice(0, openIdx)
+    if (text) {
+      events.push({ type: "text", text })
+    }
+    state.inThinking = true
+    remaining = remaining.slice(openIdx + THINKING_OPEN_TAG.length)
+  }
+
+  return events
+}
+
+export function flushThinkingTagTextDelta(
+  state: ThinkingTagStreamState
+): ThinkingTagStreamEvent[] {
+  if (!state.pending) return []
+
+  const pending = state.pending
+  state.pending = ""
+  return state.inThinking
+    ? [{ type: "thinking", text: pending }]
+    : [{ type: "text", text: pending }]
+}
+
+export function splitThinkingTaggedText(text: string): ContentBlock[] {
+  if (!text) return []
+
+  const state = createThinkingTagStreamState()
+  const events = [
+    ...consumeThinkingTagTextDelta(state, text),
+    ...flushThinkingTagTextDelta(state),
+  ]
+  const blocks: ContentBlock[] = []
+
+  for (const event of events) {
+    if (event.type === "thinking_end") continue
+
+    const lastBlock = blocks[blocks.length - 1]
+    if (event.type === "text") {
+      if (lastBlock?.type === "text") {
+        lastBlock.text += event.text
+      } else {
+        blocks.push({ type: "text", text: event.text })
+      }
+      continue
+    }
+
+    if (lastBlock?.type === "thinking") {
+      lastBlock.thinking += event.text
+    } else {
+      blocks.push({ type: "thinking", thinking: event.text })
+    }
+  }
+
+  return blocks
+}
+
 // ── Streaming state ────────────────────────────────────────────────────
 
 interface StreamState {
@@ -145,6 +283,8 @@ interface StreamState {
   model: string
   messageStartEmitted: boolean
   thinkingBlockActive: boolean
+  textBlockActive: boolean
+  thinkingTagState: ThinkingTagStreamState
 }
 
 function createStreamState(): StreamState {
@@ -156,6 +296,8 @@ function createStreamState(): StreamState {
     model: "",
     messageStartEmitted: false,
     thinkingBlockActive: false,
+    textBlockActive: false,
+    thinkingTagState: createThinkingTagStreamState(),
   }
 }
 
@@ -855,10 +997,25 @@ export class OpenaiCompatService implements OnModuleInit {
     const content: ContentBlock[] = []
     let hasToolCall = false
 
-    // Text content
+    const providerReasoning = message?.reasoning
+    if (typeof providerReasoning === "string" && providerReasoning) {
+      content.push({ type: "thinking", thinking: providerReasoning })
+    } else if (
+      providerReasoning &&
+      typeof providerReasoning === "object" &&
+      typeof (providerReasoning as Record<string, unknown>).content === "string"
+    ) {
+      content.push({
+        type: "thinking",
+        thinking: (providerReasoning as Record<string, unknown>)
+          .content as string,
+      })
+    }
+
+    // Text content, including providers that wrap reasoning in <thinking> tags.
     const text = message?.content as string
     if (text) {
-      content.push({ type: "text", text })
+      content.push(...splitThinkingTaggedText(text))
     }
 
     // Tool calls
@@ -1157,6 +1314,32 @@ export class OpenaiCompatService implements OnModuleInit {
     return results
   }
 
+  private emitTextDelta(state: StreamState, text: string): string[] {
+    if (!text) return []
+
+    const results: string[] = []
+    if (!state.textBlockActive) {
+      results.push(
+        formatSseEvent("content_block_start", {
+          type: "content_block_start",
+          index: state.blockIndex,
+          content_block: { type: "text", text: "" },
+        })
+      )
+      state.textBlockActive = true
+    }
+
+    results.push(
+      formatSseEvent("content_block_delta", {
+        type: "content_block_delta",
+        index: state.blockIndex,
+        delta: { type: "text_delta", text },
+      })
+    )
+
+    return results
+  }
+
   private closeThinkingBlock(state: StreamState): string[] {
     if (!state.thinkingBlockActive) return []
 
@@ -1168,6 +1351,78 @@ export class OpenaiCompatService implements OnModuleInit {
       }),
     ]
     state.blockIndex++
+    return results
+  }
+
+  private closeTextBlock(state: StreamState): string[] {
+    if (!state.textBlockActive) return []
+
+    state.textBlockActive = false
+    const results = [
+      formatSseEvent("content_block_stop", {
+        type: "content_block_stop",
+        index: state.blockIndex,
+      }),
+    ]
+    state.blockIndex++
+    return results
+  }
+
+  private consumeTaggedContentDelta(
+    state: StreamState,
+    contentDelta: string
+  ): string[] {
+    const results: string[] = []
+
+    for (const event of consumeThinkingTagTextDelta(
+      state.thinkingTagState,
+      contentDelta
+    )) {
+      if (event.type === "text") {
+        if (state.thinkingBlockActive) {
+          results.push(...this.closeThinkingBlock(state))
+        }
+        results.push(...this.emitTextDelta(state, event.text))
+        continue
+      }
+
+      if (event.type === "thinking") {
+        if (state.textBlockActive) {
+          results.push(...this.closeTextBlock(state))
+        }
+        results.push(...this.emitThinkingDelta(state, event.text))
+        continue
+      }
+
+      results.push(...this.closeThinkingBlock(state))
+    }
+
+    return results
+  }
+
+  private flushPendingTaggedContent(state: StreamState): string[] {
+    const results: string[] = []
+
+    for (const event of flushThinkingTagTextDelta(state.thinkingTagState)) {
+      if (event.type === "text") {
+        if (state.thinkingBlockActive) {
+          results.push(...this.closeThinkingBlock(state))
+        }
+        results.push(...this.emitTextDelta(state, event.text))
+        continue
+      }
+
+      if (event.type === "thinking_end") {
+        results.push(...this.closeThinkingBlock(state))
+        continue
+      }
+
+      if (state.textBlockActive) {
+        results.push(...this.closeTextBlock(state))
+      }
+      results.push(...this.emitThinkingDelta(state, event.text))
+    }
+
     return results
   }
 
@@ -1237,6 +1492,9 @@ export class OpenaiCompatService implements OnModuleInit {
       deltaReasoning || deltaReasoningContent || delta.reasoning_text
 
     if (typeof deltaReasoningText === "string" && deltaReasoningText) {
+      if (state.textBlockActive) {
+        results.push(...this.closeTextBlock(state))
+      }
       const source = deltaReasoning
         ? "delta.reasoning"
         : deltaReasoningContent
@@ -1252,6 +1510,9 @@ export class OpenaiCompatService implements OnModuleInit {
         ? (providerMessage as Record<string, unknown>).reasoning
         : undefined
     if (typeof providerReasoning === "string" && providerReasoning) {
+      if (state.textBlockActive) {
+        results.push(...this.closeTextBlock(state))
+      }
       this.logReasoningHit("message.reasoning", providerReasoning)
       results.push(...this.emitThinkingDelta(state, providerReasoning))
     } else if (
@@ -1259,6 +1520,9 @@ export class OpenaiCompatService implements OnModuleInit {
       typeof providerReasoning === "object" &&
       typeof (providerReasoning as Record<string, unknown>).content === "string"
     ) {
+      if (state.textBlockActive) {
+        results.push(...this.closeTextBlock(state))
+      }
       results.push(
         ...this.emitThinkingDelta(
           state,
@@ -1270,29 +1534,7 @@ export class OpenaiCompatService implements OnModuleInit {
     // Handle text content delta
     const contentDelta = delta.content as string | null
     if (contentDelta != null && contentDelta !== "") {
-      closeThinkingBeforeContent()
-      // Start a new text block if this is the first text content
-      if (
-        state.blockIndex === 0 ||
-        // Need to start a new text block after tool blocks
-        (state.hasToolCall && state.activeToolCalls.size === 0)
-      ) {
-        results.push(
-          formatSseEvent("content_block_start", {
-            type: "content_block_start",
-            index: state.blockIndex,
-            content_block: { type: "text", text: "" },
-          })
-        )
-      }
-
-      results.push(
-        formatSseEvent("content_block_delta", {
-          type: "content_block_delta",
-          index: state.blockIndex,
-          delta: { type: "text_delta", text: contentDelta },
-        })
-      )
+      results.push(...this.consumeTaggedContentDelta(state, contentDelta))
     }
 
     // Handle tool call deltas
@@ -1305,17 +1547,9 @@ export class OpenaiCompatService implements OnModuleInit {
         const func = tc.function as Record<string, unknown> | undefined
 
         if (!state.activeToolCalls.has(tcIndex)) {
+          results.push(...this.flushPendingTaggedContent(state))
           closeThinkingBeforeContent()
-          // Close previous content block if needed
-          if (state.blockIndex > 0 || contentDelta != null) {
-            results.push(
-              formatSseEvent("content_block_stop", {
-                type: "content_block_stop",
-                index: state.blockIndex,
-              })
-            )
-            state.blockIndex++
-          }
+          results.push(...this.closeTextBlock(state))
 
           // New tool call
           state.hasToolCall = true
@@ -1372,15 +1606,19 @@ export class OpenaiCompatService implements OnModuleInit {
 
     // Handle finish
     if (finishReason) {
+      results.push(...this.flushPendingTaggedContent(state))
       closeThinkingBeforeContent()
-      // Close the current content block
-      results.push(
-        formatSseEvent("content_block_stop", {
-          type: "content_block_stop",
-          index: state.blockIndex,
-        })
-      )
-      state.blockIndex++
+      results.push(...this.closeTextBlock(state))
+
+      if (state.activeToolCalls.size > 0) {
+        results.push(
+          formatSseEvent("content_block_stop", {
+            type: "content_block_stop",
+            index: state.blockIndex,
+          })
+        )
+        state.blockIndex++
+      }
 
       // Determine stop reason
       let stopReason: string
@@ -1417,8 +1655,18 @@ export class OpenaiCompatService implements OnModuleInit {
    * Emit final stream end events (fallback if finish_reason was missed).
    */
   private *emitStreamEnd(state: StreamState): Generator<string, void, unknown> {
+    const pendingTaggedContent = this.flushPendingTaggedContent(state)
+    for (const event of pendingTaggedContent) {
+      yield event
+    }
+
     const pendingThinking = this.closeThinkingBlock(state)
     for (const event of pendingThinking) {
+      yield event
+    }
+
+    const pendingText = this.closeTextBlock(state)
+    for (const event of pendingText) {
       yield event
     }
 
