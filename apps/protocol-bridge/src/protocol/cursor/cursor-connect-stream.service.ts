@@ -27,6 +27,7 @@ import { CodexService } from "../../llm/codex/codex.service"
 import { OpenaiCompatService } from "../../llm/openai-compat/openai-compat.service"
 import { GoogleService } from "../../llm/google/google.service"
 import { BackendType, ModelRouterService } from "../../llm/model-router.service"
+import { backendRequiresCompleteToolBatchBeforeContinuation } from "../../llm/tool-continuation-policy"
 import { CreateMessageDto } from "../anthropic/dto/create-message.dto"
 import { generateTraceId } from "./agent-helpers"
 import { normalizeBugfixResultItems as normalizeBugfixResultItemsFromContract } from "./bugfix-result-normalizer"
@@ -800,6 +801,16 @@ export class CursorConnectStreamService {
     return backend === "google" || backend === "google-claude"
   }
 
+  private shouldDeferToolBatchContinuation(
+    backend: BackendType,
+    pendingToolUseIds: string[]
+  ): boolean {
+    return (
+      pendingToolUseIds.length > 0 &&
+      backendRequiresCompleteToolBatchBeforeContinuation(backend)
+    )
+  }
+
   private extractLatestUserPlainText(
     messages: Array<{ role: "user" | "assistant"; content: MessageContent }>
   ): string | null {
@@ -1131,14 +1142,29 @@ export class CursorConnectStreamService {
         `Applied truncation (${contextLabel}): ${primary.original_token_count} -> ${primary.truncated_token_count} tokens`
       )
 
-      // Post-truncation integrity safety net: sanitize any orphaned tool blocks
-      const sanitized = this.truncator.validateIntegrity(
-        truncatedMessages as UnifiedMessage[]
+      // Post-truncation integrity repair: fix any orphaned tool blocks
+      // Use 'global' mode because truncation may leave tool_use/tool_result
+      // pairs separated across non-adjacent messages.
+      const postTruncNormalized = normalizeToolProtocolMessages(
+        truncatedMessages as Array<{
+          role: "user" | "assistant"
+          content: unknown
+        }>,
+        {
+          mode: "global",
+          pendingToolUseIds: options?.pendingToolUseIds,
+        }
       )
-      if (sanitized.length > 0) {
+      if (postTruncNormalized.changed) {
         this.logger.warn(
-          `Post-truncation integrity issues (${contextLabel}): ${sanitized.join("; ")}`
+          `Post-truncation integrity repair (${contextLabel}): ` +
+            `injected ${postTruncNormalized.injectedToolResults} synthetic tool_result, ` +
+            `removed ${postTruncNormalized.removedToolResults} orphan tool_result`
         )
+        return postTruncNormalized.messages as Array<{
+          role: "user" | "assistant"
+          content: MessageContent
+        }>
       }
     }
 
@@ -5866,6 +5892,12 @@ ${raw}
             )
             continue
           }
+          if (sessionBeforeRun && sessionBeforeRun.pendingToolCalls.size > 0) {
+            this.logger.warn(
+              `Received a new chat turn while ${sessionBeforeRun.pendingToolCalls.size} tool result(s) are still pending; waiting for tool results before starting a new model turn`
+            )
+            continue
+          }
 
           // Handle run turn with the established conversationId.
           yield* this.handleChatMessage(conversationId!, parsed)
@@ -6464,17 +6496,17 @@ ${raw}
   /**
    * Handle tool result and continue conversation
    *
-   * CRITICAL CHANGE: Real-time feedback loop
-   * - Receive tool result → IMMEDIATELY add to message history
-   * - IMMEDIATELY continue AI generation (no waiting for other tools)
-   * - This implements true serial tool processing
+   * Real-time feedback loop with backend-aware continuation:
+   * - Receive tool result -> immediately add to message history
+   * - Continue the model turn as soon as the target backend allows it
+   * - Strict backends must wait until the current assistant tool batch is closed
    *
    * Flow:
-   * 1. Receive tool result → Format it
+   * 1. Receive tool result -> format it
    * 2. Remove from pendingToolCalls
-   * 3. IMMEDIATELY add tool_use + tool_result to message history
-   * 4. IMMEDIATELY continue AI generation
-   * 5. AI may return more tool calls → send them immediately
+   * 3. Immediately add tool_use + tool_result to message history
+   * 4. Continue now, or defer until the remaining tool results arrive
+   * 5. AI may return more tool calls -> send them immediately
    */
 
   /**
@@ -6758,6 +6790,20 @@ ${raw}
       const route = this.modelRouter.resolveModel(session.model)
       const backendModel = route.model
       const backendLabel = route.backend
+      const remainingPendingToolUseIds =
+        this.sessionManager.getPendingToolCallIds(conversationId)
+
+      if (
+        this.shouldDeferToolBatchContinuation(
+          route.backend,
+          remainingPendingToolUseIds
+        )
+      ) {
+        this.logger.log(
+          `Deferring ${route.backend} shell continuation until ${remainingPendingToolUseIds.length} pending tool result(s) arrive`
+        )
+        return
+      }
 
       const toolsToUse = session.supportedTools || []
       if (toolsToUse.length === 0) {
@@ -6792,8 +6838,7 @@ ${raw}
         }>,
         `shell continuation: ${conversationId}`,
         {
-          pendingToolUseIds:
-            this.sessionManager.getPendingToolCallIds(conversationId),
+          pendingToolUseIds: remainingPendingToolUseIds,
         }
       )
       this.sessionManager.replaceMessages(
@@ -6812,8 +6857,7 @@ ${raw}
         {
           preferSummary: !this.hasStructuredToolContent(normalizedShellHistory),
           contextLabel: `shell continuation: ${conversationId}`,
-          pendingToolUseIds:
-            this.sessionManager.getPendingToolCallIds(conversationId),
+          pendingToolUseIds: remainingPendingToolUseIds,
         }
       )
 
@@ -6825,8 +6869,7 @@ ${raw}
         stream: true,
         tools: apiTools,
       }
-      dto._pendingToolUseIds =
-        this.sessionManager.getPendingToolCallIds(conversationId)
+      dto._pendingToolUseIds = remainingPendingToolUseIds
 
       // 续流中保持 thinking 配置（与主流一致）
       if (session.thinkingLevel > 0) {
@@ -7639,13 +7682,29 @@ ${raw}
       toolResultContent
     )
 
-    // CRITICAL: Immediately continue AI generation (no waiting for other tools)
+    // Continue AI generation immediately for backends that allow partial
+    // tool-result continuation. Cloud Code must wait until the current
+    // assistant tool batch is fully closed.
     // Map Cursor model name to backend model name
     const route = this.modelRouter.resolveModel(session.model)
     const backendModel = route.model
+    const remainingPendingToolUseIds =
+      this.sessionManager.getPendingToolCallIds(conversationId)
     this.logger.debug(
       `Mapped Cursor model "${session.model}" to backend model "${backendModel}" for tool result continuation (backend=${route.backend})`
     )
+
+    if (
+      this.shouldDeferToolBatchContinuation(
+        route.backend,
+        remainingPendingToolUseIds
+      )
+    ) {
+      this.logger.log(
+        `Deferring ${route.backend} tool continuation until ${remainingPendingToolUseIds.length} pending tool result(s) arrive`
+      )
+      return
+    }
 
     const toolsForContinuation = session.supportedTools || []
     if (toolsForContinuation.length === 0) {
@@ -7680,8 +7739,7 @@ ${raw}
       }>,
       `tool continuation: ${conversationId}`,
       {
-        pendingToolUseIds:
-          this.sessionManager.getPendingToolCallIds(conversationId),
+        pendingToolUseIds: remainingPendingToolUseIds,
       }
     )
     this.sessionManager.replaceMessages(
@@ -7702,8 +7760,7 @@ ${raw}
           normalizedContinuationHistory
         ),
         contextLabel: `tool continuation: ${conversationId}`,
-        pendingToolUseIds:
-          this.sessionManager.getPendingToolCallIds(conversationId),
+        pendingToolUseIds: remainingPendingToolUseIds,
       }
     )
 
@@ -7715,8 +7772,7 @@ ${raw}
       stream: true,
       tools: continuationTools,
     }
-    dto._pendingToolUseIds =
-      this.sessionManager.getPendingToolCallIds(conversationId)
+    dto._pendingToolUseIds = remainingPendingToolUseIds
 
     // 续流中保持 thinking 配置（与主流一致）
     if (session.thinkingLevel > 0) {

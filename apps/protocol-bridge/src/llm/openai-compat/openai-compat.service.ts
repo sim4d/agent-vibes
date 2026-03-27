@@ -628,7 +628,7 @@ export class OpenaiCompatService implements OnModuleInit {
     // corresponding assistant tool_calls block. OpenAI API requires every
     // tool_call to have a matching tool response. Strip orphan tool_calls
     // and orphan tool responses to prevent 400 errors.
-    this.sanitizeToolCallIntegrity(messages)
+    this.sanitizeToolCallIntegrity(messages, dto._pendingToolUseIds)
 
     // Build request
     const request: ChatCompletionRequest = {
@@ -686,9 +686,15 @@ export class OpenaiCompatService implements OnModuleInit {
   /**
    * Ensure every assistant tool_call has a matching tool response and
    * every tool response has a matching tool_call. Strip any orphans.
+   * Tool calls whose IDs appear in pendingToolUseIds are preserved
+   * (they are still awaiting a response from the model).
    * Mutates the array in-place.
    */
-  private sanitizeToolCallIntegrity(messages: ChatCompletionMessage[]): void {
+  private sanitizeToolCallIntegrity(
+    messages: ChatCompletionMessage[],
+    pendingToolUseIds?: string[]
+  ): void {
+    const pendingIds = new Set(pendingToolUseIds || [])
     // Collect all tool response IDs
     const toolResponseIds = new Set<string>()
     for (const msg of messages) {
@@ -712,7 +718,9 @@ export class OpenaiCompatService implements OnModuleInit {
       if (msg.role !== "assistant" || !msg.tool_calls) continue
 
       const before = msg.tool_calls.length
-      msg.tool_calls = msg.tool_calls.filter((tc) => toolResponseIds.has(tc.id))
+      msg.tool_calls = msg.tool_calls.filter(
+        (tc) => toolResponseIds.has(tc.id) || pendingIds.has(tc.id)
+      )
 
       if (msg.tool_calls.length < before) {
         this.logger.warn(

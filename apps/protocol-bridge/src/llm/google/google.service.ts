@@ -9,6 +9,7 @@ import { CreateMessageDto } from "../../protocol/anthropic/dto/create-message.dt
 import type { AnthropicResponse, ContentBlock } from "../../shared/anthropic"
 import { DEFAULT_CLAUDE_MODEL, resolveCloudCodeModel } from "../model-registry"
 import { ProcessPoolService } from "../native/process-pool.service"
+import { findPendingToolUseIdsInMessages } from "../tool-continuation-policy"
 import { ToolThoughtSignatureService } from "./tool-thought-signature.service"
 
 class FatalCloudCodeRequestError extends Error {
@@ -1859,10 +1860,26 @@ export class GoogleService {
     // Claude Code often echoes the task text after tool_result
     let lastUserTaskTextNormalized: string | null = null
 
-    const protocolNormalized = normalizeToolProtocolMessages(
-      dto.messages as Array<{ role: "user" | "assistant"; content: unknown }>,
-      { pendingToolUseIds: dto._pendingToolUseIds }
+    const sourceMessages = dto.messages as Array<{
+      role: "user" | "assistant"
+      content: unknown
+    }>
+    const blockingPendingToolUseIds = findPendingToolUseIdsInMessages(
+      sourceMessages,
+      dto._pendingToolUseIds
     )
+    if (blockingPendingToolUseIds.length > 0) {
+      throw new FatalCloudCodeRequestError(
+        `Cloud Code Claude cannot continue while ${blockingPendingToolUseIds.length} tool result(s) are still pending: ${blockingPendingToolUseIds.slice(0, 3).join(", ")}`
+      )
+    }
+
+    // Cloud Code Claude requires strict assistant(tool_use) -> next
+    // user(tool_result) adjacency. Do not relax send-path normalization.
+    const protocolNormalized = normalizeToolProtocolMessages(sourceMessages, {
+      mode: "strict-adjacent",
+      pendingToolUseIds: dto._pendingToolUseIds,
+    })
     if (
       protocolNormalized.removedToolResults > 0 ||
       protocolNormalized.injectedToolResults > 0
