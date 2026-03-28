@@ -26,7 +26,11 @@ import {
 import { CodexService } from "../../llm/codex/codex.service"
 import { OpenaiCompatService } from "../../llm/openai-compat/openai-compat.service"
 import { GoogleService } from "../../llm/google/google.service"
-import { BackendType, ModelRouterService } from "../../llm/model-router.service"
+import {
+  BackendType,
+  ModelRouteResult,
+  ModelRouterService,
+} from "../../llm/model-router.service"
 import { backendRequiresCompleteToolBatchBeforeContinuation } from "../../llm/tool-continuation-policy"
 import { CreateMessageDto } from "../anthropic/dto/create-message.dto"
 import { generateTraceId } from "./agent-helpers"
@@ -627,6 +631,116 @@ export class CursorConnectStreamService {
     return true
   }
 
+  private summarizeBackendError(error: unknown): string {
+    const message = error instanceof Error ? error.message : String(error)
+    return message.length > 200 ? `${message.slice(0, 200)}…` : message
+  }
+
+  private async *executeBackendStreamWithFallback(
+    dto: CreateMessageDto,
+    route: ModelRouteResult,
+    attemptedBackends: Set<string> = new Set()
+  ): AsyncGenerator<string, void, unknown> {
+    attemptedBackends.add(route.backend)
+    const routedDto = { ...dto, model: route.model }
+    // Buffer envelope events (message_start, ping) AND structural events
+    // (content_block_start, content_block_stop) so we can discard them on
+    // fallback.  Only once a content_block_delta arrives (i.e., actual
+    // user-visible content has been streamed) do we flush & lock in.
+    let emittedAny = false
+    let buffer: string[] = []
+
+    const handleEvent = function* (event: string) {
+      if (!emittedAny) {
+        if (
+          event.includes('"type":"message_start"') ||
+          event.includes('"type":"ping"') ||
+          event.includes('"type":"content_block_start"') ||
+          event.includes('"type":"content_block_stop"')
+        ) {
+          buffer.push(event)
+        } else {
+          emittedAny = true
+          for (const b of buffer) yield b
+          buffer = []
+          yield event
+        }
+      } else {
+        yield event
+      }
+    }
+
+    try {
+      if (route.backend === "openai-compat") {
+        this.logger.log(
+          `Routing to OpenAI-compat backend for model: ${route.model}`
+        )
+        for await (const event of this.openaiCompatService.sendClaudeMessageStream(
+          routedDto
+        )) {
+          yield* handleEvent(event)
+        }
+        if (!emittedAny) {
+          for (const b of buffer) yield b
+        }
+        return
+      }
+
+      if (route.backend === "codex") {
+        this.logger.log(`Routing to Codex backend for model: ${route.model}`)
+        for await (const event of this.codexService.sendClaudeMessageStream(
+          routedDto
+        )) {
+          yield* handleEvent(event)
+        }
+        if (!emittedAny) {
+          for (const b of buffer) yield b
+        }
+        return
+      }
+
+      this.logger.log(`Routing to Google backend for model: ${route.model}`)
+      for await (const event of this.googleService.sendClaudeMessageStream(
+        routedDto
+      )) {
+        yield* handleEvent(event)
+      }
+      if (!emittedAny) {
+        for (const b of buffer) yield b
+      }
+    } catch (error) {
+      const fallback = this.modelRouter.getFallbackRoute(
+        dto.model,
+        route.backend
+      )
+      const canFallback =
+        !emittedAny &&
+        !!fallback &&
+        !attemptedBackends.has(fallback.backend) &&
+        this.modelRouter.shouldFallbackFromBackend(
+          error,
+          route.backend,
+          fallback.backend
+        )
+
+      if (canFallback && fallback) {
+        this.logger.warn(
+          `Backend ${route.backend} failed for ${dto.model}: ${this.summarizeBackendError(
+            error
+          )}; falling back to ${fallback.backend}`
+        )
+        yield* this.executeBackendStreamWithFallback(
+          dto,
+          fallback,
+          attemptedBackends
+        )
+        return
+      }
+
+      throw error
+    }
+  }
+
   /**
    * Get the appropriate message stream based on model
    * Uses ModelRouterService for centralized routing logic
@@ -635,24 +749,7 @@ export class CursorConnectStreamService {
     dto: CreateMessageDto
   ): AsyncGenerator<string, void, unknown> {
     const route = this.modelRouter.resolveModel(dto.model)
-    const routedDto = { ...dto, model: route.model }
-
-    // Route to OpenAI-compatible backend
-    if (route.backend === "openai-compat") {
-      this.logger.log(
-        `Routing to OpenAI-compat backend for model: ${route.model}`
-      )
-      return this.openaiCompatService.sendClaudeMessageStream(routedDto)
-    }
-
-    // Route to Codex backend for GPT/O-series models
-    if (route.backend === "codex") {
-      this.logger.log(`Routing to Codex backend for model: ${route.model}`)
-      return this.codexService.sendClaudeMessageStream(routedDto)
-    }
-
-    this.logger.log(`Routing to Google backend for model: ${route.model}`)
-    return this.googleService.sendClaudeMessageStream(routedDto)
+    return this.executeBackendStreamWithFallback(dto, route)
   }
 
   private normalizePositiveInteger(value: unknown): number | undefined {
@@ -5417,6 +5514,7 @@ ${raw}
     } = params
 
     const input = this.parseToolInputJson(toolCall.inputJson)
+
     const deferredToolFamily = this.normalizeDeferredToolFamily(toolCall.name)
     if (deferredToolFamily === "glob_search") {
       this.primeGlobDeferredInputForProtocol(conversationId, input)

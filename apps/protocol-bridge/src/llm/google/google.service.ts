@@ -56,6 +56,7 @@ export class GoogleService {
   private readonly BASE_RETRY_DELAY = 1200 // Base for 429 without retryDelay (ms)
   private readonly MAX_RETRY_DELAY = 60000 // Cap for exponential backoff (60s for rate limit recovery)
   private readonly MAX_429_WAIT_MS = 5 * 60 * 1000 // Cap API retryMs (5 min), allow longer recovery
+  private readonly QUOTA_EXHAUSTED_DEFAULT_COOLDOWN_MS = 15 * 60 * 1000 // Fallback cooldown when quota exhausted but no reset time parsed (15 min)
   private readonly MAX_PROMPT_SHRINK_RETRIES: number = 3
   private readonly CLOUD_CODE_DEFAULT_OUTPUT_TOKENS: number = 65536
   private readonly CLOUD_CODE_MAX_OUTPUT_TOKENS: number = 65536
@@ -2712,18 +2713,18 @@ export class GoogleService {
 
     // Ensure we have at least a type
     if (!sanitized.type) {
-      sanitized.type = "object"
+      sanitized.type = "OBJECT"
     }
 
     // If object type with no properties, add placeholder
     if (
-      sanitized.type === "object" &&
+      (sanitized.type === "object" || sanitized.type === "OBJECT") &&
       (!sanitized.properties ||
         Object.keys(sanitized.properties as Record<string, unknown>).length ===
           0)
     ) {
       sanitized.properties = {
-        reason: { type: "string", description: "Reason for calling this tool" },
+        reason: { type: "STRING", description: "Reason for calling this tool" },
       }
       sanitized.required = ["reason"]
     }
@@ -2786,7 +2787,8 @@ export class GoogleService {
       if (Array.isArray(result[unionKey])) {
         const options = result[unionKey] as Array<Record<string, unknown>>
         const bestOption =
-          options.find((o) => o && o.type !== "null") || options[0]
+          options.find((o) => o && o.type !== "null" && o.type !== "NULL") ||
+          options[0]
         delete result[unionKey]
         if (bestOption) {
           for (const [key, value] of Object.entries(bestOption)) {
@@ -2801,8 +2803,10 @@ export class GoogleService {
     // Handle type arrays - select first non-null type
     if (Array.isArray(result.type)) {
       const types = result.type as string[]
-      const nonNullTypes = types.filter((t) => t !== "null")
-      result.type = nonNullTypes[0] || "string"
+      const nonNullTypes = types.filter((t) => t !== "null" && t !== "NULL")
+      result.type = (nonNullTypes[0] || "string").toUpperCase()
+    } else if (typeof result.type === "string") {
+      result.type = result.type.toUpperCase()
     }
 
     // Remove unsupported keywords
@@ -3004,10 +3008,9 @@ export class GoogleService {
           const exhausted = this.isQuotaExhausted(errMsg)
           // Quota exhausted: use full reset duration (hours/days), uncapped
           // Transient rate limit: keep capped behavior
-          const cooldownMs =
-            exhausted && retryMs !== null
-              ? retryMs
-              : Math.min(retryMs ?? 60_000, this.MAX_429_WAIT_MS)
+          const cooldownMs = exhausted
+            ? (retryMs ?? this.QUOTA_EXHAUSTED_DEFAULT_COOLDOWN_MS)
+            : Math.min(retryMs ?? 60_000, this.MAX_429_WAIT_MS)
           this.processPool.setCooldown(cooldownMs)
 
           if (this.processPool.hasAvailableWorker()) {
@@ -3261,10 +3264,9 @@ export class GoogleService {
             const retryMs = self.parseRetryDelayMs(errMsg)
             const exhausted = self.isQuotaExhausted(errMsg)
             // Quota exhausted: use full reset duration, uncapped
-            const cooldownMs =
-              exhausted && retryMs !== null
-                ? retryMs
-                : Math.min(retryMs ?? 60_000, self.MAX_429_WAIT_MS)
+            const cooldownMs = exhausted
+              ? (retryMs ?? self.QUOTA_EXHAUSTED_DEFAULT_COOLDOWN_MS)
+              : Math.min(retryMs ?? 60_000, self.MAX_429_WAIT_MS)
             self.processPool.setCooldown(cooldownMs)
 
             if (!isLast && self.processPool.hasAvailableWorker()) {

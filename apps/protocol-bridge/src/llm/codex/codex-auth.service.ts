@@ -18,6 +18,9 @@
 
 import { Injectable, Logger } from "@nestjs/common"
 import * as crypto from "crypto"
+import * as fs from "fs"
+import * as os from "os"
+import * as path from "path"
 import { CodexModelTier, normalizeCodexModelTier } from "../model-registry"
 
 // ── OAuth Constants (matching codex_cli_rs) ────────────────────────────
@@ -26,6 +29,12 @@ const AUTH_URL = "https://auth.openai.com/oauth/authorize"
 const TOKEN_URL = "https://auth.openai.com/oauth/token"
 const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 const REDIRECT_URI = "http://localhost:1455/auth/callback"
+
+/** Persisted token file path — survives process restarts */
+const TOKEN_FILE_PATH = path.join(
+  process.env.CODEX_HOME || path.join(os.homedir(), ".codex"),
+  "agent-vibes-tokens.json"
+)
 
 // ── Types ──────────────────────────────────────────────────────────────
 
@@ -263,13 +272,17 @@ export class CodexAuthService {
         const tokenData = await this.refreshTokens(refreshToken)
         this.tokenData = tokenData
         this.lastRefresh = new Date().toISOString()
+        this.persistTokens()
         return tokenData
       } catch (e) {
         lastError = e as Error
         const errorMsg = lastError.message.toLowerCase()
 
-        // Non-retryable errors
-        if (errorMsg.includes("refresh_token_reused")) {
+        // Non-retryable errors (token rotation violation or revoked)
+        if (
+          errorMsg.includes("refresh_token_reused") ||
+          errorMsg.includes("already been used")
+        ) {
           this.logger.warn(
             `Token refresh attempt ${attempt + 1} failed with non-retryable error: ${lastError.message}`
           )
@@ -402,5 +415,80 @@ export class CodexAuthService {
     }
 
     return this.tokenData.accessToken || null
+  }
+
+  // ── Token Persistence ───────────────────────────────────────────────
+
+  /**
+   * Persist current token data to disk so it survives process restarts.
+   * Ported from: internal/auth/codex/token.go SaveTokenToFile()
+   */
+  private persistTokens(): void {
+    if (!this.tokenData) return
+
+    try {
+      const dir = path.dirname(TOKEN_FILE_PATH)
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+
+      const payload = {
+        type: "codex",
+        id_token: this.tokenData.idToken,
+        access_token: this.tokenData.accessToken,
+        refresh_token: this.tokenData.refreshToken,
+        account_id: this.tokenData.accountId,
+        email: this.tokenData.email,
+        expire: this.tokenData.expire,
+        last_refresh: this.lastRefresh,
+      }
+
+      // Atomic write: write to .tmp then rename to prevent partial writes
+      const tmpPath = `${TOKEN_FILE_PATH}.tmp`
+      fs.writeFileSync(tmpPath, JSON.stringify(payload, null, 2), {
+        mode: 0o600,
+      })
+      fs.renameSync(tmpPath, TOKEN_FILE_PATH)
+      this.logger.debug(`Tokens persisted to ${TOKEN_FILE_PATH}`)
+    } catch (e) {
+      this.logger.warn(`Failed to persist tokens: ${(e as Error).message}`)
+    }
+  }
+
+  /**
+   * Load persisted token data from disk.
+   * Returns null if the file does not exist or is malformed.
+   */
+  loadPersistedTokens(): CodexTokenData | null {
+    try {
+      if (!fs.existsSync(TOKEN_FILE_PATH)) {
+        return null
+      }
+
+      const raw = fs.readFileSync(TOKEN_FILE_PATH, "utf8")
+      const parsed = JSON.parse(raw) as Record<string, unknown>
+
+      if (parsed.type !== "codex" || !parsed.refresh_token) {
+        return null
+      }
+
+      const tokenData: CodexTokenData = {
+        idToken: (parsed.id_token as string) || "",
+        accessToken: (parsed.access_token as string) || "",
+        refreshToken: (parsed.refresh_token as string) || "",
+        accountId: (parsed.account_id as string) || "",
+        email: (parsed.email as string) || "",
+        // Support both 'expire' (new) and 'expired' (legacy) field names
+        expire: (parsed.expire as string) || (parsed.expired as string) || "",
+      }
+
+      this.logger.log(
+        `Loaded persisted Codex tokens from ${TOKEN_FILE_PATH} (email=${tokenData.email || "unknown"})`
+      )
+      return tokenData
+    } catch (e) {
+      this.logger.warn(
+        `Failed to load persisted tokens: ${(e as Error).message}`
+      )
+      return null
+    }
   }
 }

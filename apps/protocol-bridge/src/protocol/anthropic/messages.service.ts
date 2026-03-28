@@ -9,7 +9,10 @@ import {
   getPublicModelMetadata,
   resolveCloudCodeModel,
 } from "../../llm/model-registry"
-import { ModelRouterService } from "../../llm/model-router.service"
+import {
+  ModelRouteResult,
+  ModelRouterService,
+} from "../../llm/model-router.service"
 import { OpenaiCompatService } from "../../llm/openai-compat/openai-compat.service"
 import type { AnthropicResponse } from "../../shared/anthropic"
 import { CountTokensDto } from "./dto/count-tokens.dto"
@@ -224,6 +227,162 @@ export class MessagesService implements OnModuleInit {
     }
   }
 
+  private summarizeBackendError(error: unknown): string {
+    const message = error instanceof Error ? error.message : String(error)
+    return message.length > 200 ? `${message.slice(0, 200)}…` : message
+  }
+
+  private async executeRoutedMessage(
+    dto: CreateMessageDto,
+    route: ModelRouteResult,
+    attemptedBackends: Set<string> = new Set()
+  ): Promise<AnthropicResponse> {
+    attemptedBackends.add(route.backend)
+    const routedDto = { ...dto, model: route.model }
+
+    try {
+      if (route.backend === "openai-compat") {
+        this.logger.log(`[ROUTE] OpenAI-compat backend | model: ${route.model}`)
+        return await this.openaiCompatService.sendClaudeMessage(routedDto)
+      }
+
+      if (route.backend === "codex") {
+        this.logger.log(`[ROUTE] Codex backend | model: ${route.model}`)
+        return await this.codexService.sendClaudeMessage(routedDto)
+      }
+
+      this.logger.log(`[ROUTE] Google backend | model: ${route.model}`)
+      return await this.googleService.sendClaudeMessage(
+        this.prepareForGoogle(routedDto)
+      )
+    } catch (error) {
+      const fallback = this.modelRouter.getFallbackRoute(
+        dto.model,
+        route.backend
+      )
+      const canFallback =
+        !!fallback &&
+        !attemptedBackends.has(fallback.backend) &&
+        this.modelRouter.shouldFallbackFromBackend(
+          error,
+          route.backend,
+          fallback.backend
+        )
+
+      if (canFallback && fallback) {
+        this.logger.warn(
+          `[ROUTE] ${route.backend} failed for ${dto.model}: ${this.summarizeBackendError(
+            error
+          )}; falling back to ${fallback.backend}`
+        )
+        return this.executeRoutedMessage(dto, fallback, attemptedBackends)
+      }
+
+      throw error
+    }
+  }
+
+  private async *executeRoutedMessageStream(
+    dto: CreateMessageDto,
+    route: ModelRouteResult,
+    attemptedBackends: Set<string> = new Set()
+  ): AsyncGenerator<string, void, unknown> {
+    attemptedBackends.add(route.backend)
+    const routedDto = { ...dto, model: route.model }
+    let emittedAny = false
+    let buffer: string[] = []
+
+    const handleEvent = function* (event: string) {
+      if (!emittedAny) {
+        if (
+          event.includes('"type":"message_start"') ||
+          event.includes('"type":"ping"') ||
+          event.includes('"type":"content_block_start"') ||
+          event.includes('"type":"content_block_stop"')
+        ) {
+          buffer.push(event)
+        } else {
+          emittedAny = true
+          for (const b of buffer) yield b
+          buffer = []
+          yield event
+        }
+      } else {
+        yield event
+      }
+    }
+
+    try {
+      if (route.backend === "openai-compat") {
+        this.logger.log(
+          `[ROUTE] OpenAI-compat backend | model: ${route.model} | stream: true`
+        )
+        for await (const event of this.openaiCompatService.sendClaudeMessageStream(
+          routedDto
+        )) {
+          yield* handleEvent(event)
+        }
+        if (!emittedAny) {
+          for (const b of buffer) yield b
+        }
+        return
+      }
+
+      if (route.backend === "codex") {
+        this.logger.log(
+          `[ROUTE] Codex backend | model: ${route.model} | stream: true`
+        )
+        for await (const event of this.codexService.sendClaudeMessageStream(
+          routedDto
+        )) {
+          yield* handleEvent(event)
+        }
+        if (!emittedAny) {
+          for (const b of buffer) yield b
+        }
+        return
+      }
+
+      this.logger.log(
+        `[ROUTE] Google backend | model: ${route.model} | stream: true`
+      )
+      for await (const event of this.googleService.sendClaudeMessageStream(
+        this.prepareForGoogle(routedDto)
+      )) {
+        yield* handleEvent(event)
+      }
+      if (!emittedAny) {
+        for (const b of buffer) yield b
+      }
+    } catch (error) {
+      const fallback = this.modelRouter.getFallbackRoute(
+        dto.model,
+        route.backend
+      )
+      const canFallback =
+        !emittedAny &&
+        !!fallback &&
+        !attemptedBackends.has(fallback.backend) &&
+        this.modelRouter.shouldFallbackFromBackend(
+          error,
+          route.backend,
+          fallback.backend
+        )
+
+      if (canFallback && fallback) {
+        this.logger.warn(
+          `[ROUTE] ${route.backend} stream failed for ${dto.model}: ${this.summarizeBackendError(
+            error
+          )}; falling back to ${fallback.backend}`
+        )
+        yield* this.executeRoutedMessageStream(dto, fallback, attemptedBackends)
+        return
+      }
+
+      throw error
+    }
+  }
+
   async createMessage(dto: CreateMessageDto): Promise<AnthropicResponse> {
     this.logger.log(
       `Request for model: ${dto.model}, stream: ${dto.stream || false}`
@@ -238,24 +397,7 @@ export class MessagesService implements OnModuleInit {
 
     // Use ModelRouterService for model-based routing
     const route = this.modelRouter.resolveModel(dto.model)
-    const routedDto = { ...dto, model: route.model }
-
-    // Route to OpenAI-compatible backend
-    if (route.backend === "openai-compat") {
-      this.logger.log(`[ROUTE] OpenAI-compat backend | model: ${route.model}`)
-      return this.openaiCompatService.sendClaudeMessage(routedDto)
-    }
-
-    // Route to Codex backend for GPT/O-series models
-    if (route.backend === "codex") {
-      this.logger.log(`[ROUTE] Codex backend | model: ${route.model}`)
-      return this.codexService.sendClaudeMessage(routedDto)
-    }
-
-    this.logger.log(`[ROUTE] Google backend | model: ${route.model}`)
-    return this.googleService.sendClaudeMessage(
-      this.prepareForGoogle(routedDto)
-    )
+    return this.executeRoutedMessage(dto, route)
   }
 
   /**
@@ -275,32 +417,7 @@ export class MessagesService implements OnModuleInit {
 
     // Use ModelRouterService for model-based routing
     const route = this.modelRouter.resolveModel(dto.model)
-    const routedDto = { ...dto, model: route.model }
-
-    // Route to OpenAI-compatible backend
-    if (route.backend === "openai-compat") {
-      this.logger.log(
-        `[ROUTE] OpenAI-compat backend | model: ${route.model} | stream: true`
-      )
-      yield* this.openaiCompatService.sendClaudeMessageStream(routedDto)
-      return
-    }
-
-    // Route to Codex backend for GPT/O-series models
-    if (route.backend === "codex") {
-      this.logger.log(
-        `[ROUTE] Codex backend | model: ${route.model} | stream: true`
-      )
-      yield* this.codexService.sendClaudeMessageStream(routedDto)
-      return
-    }
-
-    this.logger.log(
-      `[ROUTE] Google backend | model: ${route.model} | stream: true`
-    )
-    yield* this.googleService.sendClaudeMessageStream(
-      this.prepareForGoogle(routedDto)
-    )
+    yield* this.executeRoutedMessageStream(dto, route)
   }
 
   /**

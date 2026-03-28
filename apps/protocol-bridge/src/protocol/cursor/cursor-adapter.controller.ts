@@ -1,9 +1,12 @@
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf"
 import { Controller, Logger, Post, Req, Res } from "@nestjs/common"
+import type { CreateMessageDto } from "../anthropic/dto/create-message.dto"
+import { MessagesService } from "../anthropic/messages.service"
 import { FastifyReply, FastifyRequest } from "fastify"
 import { CodexService } from "../../llm/codex/codex.service"
 import { OpenaiCompatService } from "../../llm/openai-compat/openai-compat.service"
 import { getCursorDisplayModels } from "../../llm/model-registry"
+import type { AnthropicResponse } from "../../shared/anthropic"
 import { connectRPCHandler } from "./connect-rpc-handler"
 import { CursorConnectStreamService } from "./cursor-connect-stream.service"
 import {
@@ -15,9 +18,22 @@ import {
   UploadConversationBlobsResponseSchema,
 } from "../../gen/agent/v1_pb"
 import {
+  BugBotStatusSchema,
+  BugBotStatus_Status,
+  BugLocationSchema,
+  BugReportSchema,
+  BugReportsSchema,
   GetDiffReviewRequestSchema,
+  ReportCommitAiAnalyticsRequestSchema,
+  ReportCommitAiAnalyticsResponseSchema,
+  StreamBugBotAgenticClientMessageSchema,
+  StreamBugBotAgenticServerMessageSchema,
+  StreamBugBotResponseSchema,
   StreamDiffReviewResponseSchema,
+  type CodeBlock,
+  type FileDiff,
   type GetDiffReviewRequest_SimpleFileDiff,
+  type StreamBugBotRequest,
 } from "../../gen/aiserver/v1_pb"
 import { KvStorageService } from "./kv-storage.service"
 
@@ -29,10 +45,17 @@ import { KvStorageService } from "./kv-storage.service"
 export class CursorAdapterController {
   private readonly logger = new Logger(CursorAdapterController.name)
 
+  /** BugBot fallback model chain (after the primary model fails) */
+  private static readonly BUGBOT_FALLBACK_MODELS = [
+    "claude-4.6-opus-thinking",
+    "gemini-3.1-pro-high",
+  ]
+
   constructor(
     private readonly connectStreamService: CursorConnectStreamService,
     private readonly codexService: CodexService,
     private readonly openaiCompatService: OpenaiCompatService,
+    private readonly messagesService: MessagesService,
     private readonly kvStorageService: KvStorageService
   ) {}
 
@@ -271,6 +294,161 @@ export class CursorAdapterController {
     return this.handleStreamDiffReview(req, res)
   }
 
+  /**
+   * aiserver.v1.AiService/StreamBugBotAgentic — Commit/diff review via BugBot.
+   *
+   * Current Cursor versions use this endpoint for the post-commit Review flow.
+   * We currently implement a minimal compatible stream that converts the git diff
+   * into a standard review prompt and returns BugBot-style findings.
+   */
+  @Post("aiserver.v1.AiService/StreamBugBotAgentic")
+  async handleStreamBugBotAgentic(
+    @Req() req: FastifyRequest,
+    @Res() res: FastifyReply
+  ): Promise<void> {
+    this.logger.log(">>> AiService/StreamBugBotAgentic request received")
+
+    try {
+      await connectRPCHandler.handleBidiStream(
+        req,
+        res,
+        async (inputMessages, output) => {
+          let startMessageParsed = false
+
+          for await (const payload of inputMessages) {
+            if (startMessageParsed) {
+              continue
+            }
+
+            const startMessage = fromBinary(
+              StreamBugBotAgenticClientMessageSchema,
+              payload
+            )
+
+            if (startMessage.message.case !== "start") {
+              this.logger.warn(
+                `Unsupported StreamBugBotAgentic message case: ${startMessage.message.case || "(none)"}`
+              )
+              continue
+            }
+
+            startMessageParsed = true
+            const request = startMessage.message.value
+            const diffCount = request.gitDiff?.diffs.length ?? 0
+            // Default to the highest tier model (gpt-5.4) if Cursor doesn't specify one
+            const model = request.modelDetails?.modelName || "gpt-5.4"
+            this.logger.log(
+              `BugBot review request: ${diffCount} file(s), model=${model}, deepReview=${request.deepReview ?? false}`
+            )
+
+            const writeFrame = (
+              payload: Parameters<
+                typeof create<typeof StreamBugBotResponseSchema>
+              >[1]
+            ) => {
+              const responseMsg = create(
+                StreamBugBotAgenticServerMessageSchema,
+                {
+                  message: {
+                    case: "bugbotResponse",
+                    value: create(StreamBugBotResponseSchema, payload),
+                  },
+                }
+              )
+              const binary = toBinary(
+                StreamBugBotAgenticServerMessageSchema,
+                responseMsg
+              )
+              const frame = connectRPCHandler.encodeMessage(Buffer.from(binary))
+              output(frame)
+            }
+
+            writeFrame({
+              status: create(BugBotStatusSchema, {
+                status: BugBotStatus_Status.IN_PROGRESS,
+                message: "Analyzing code changes...",
+                totalIterations: request.iterations ?? 1,
+                iterationsCompleted: 0,
+              }),
+            })
+
+            const keepAliveInterval = setInterval(() => {
+              try {
+                writeFrame({
+                  status: create(BugBotStatusSchema, {
+                    status: BugBotStatus_Status.IN_PROGRESS,
+                    message: "Analyzing code changes...",
+                    totalIterations: request.iterations ?? 1,
+                    iterationsCompleted: 0,
+                  }),
+                })
+              } catch {
+                clearInterval(keepAliveInterval)
+              }
+            }, 5000)
+
+            try {
+              const review = await this.generateBugBotReview(request)
+              clearInterval(keepAliveInterval)
+
+              writeFrame({
+                status: create(BugBotStatusSchema, {
+                  status: BugBotStatus_Status.DONE,
+                  message: `Found ${review.bugReports?.bugReports.length ?? 0} issue(s)`,
+                  totalIterations: request.iterations ?? 1,
+                  iterationsCompleted: request.iterations ?? 1,
+                }),
+                summary: review.summary,
+                bugReports: review.bugReports,
+              })
+
+              return
+            } catch (error) {
+              clearInterval(keepAliveInterval)
+              throw error
+            }
+          }
+        }
+      )
+      this.logger.log(">>> StreamBugBotAgentic completed successfully")
+    } catch (error) {
+      this.logger.error("Error in StreamBugBotAgentic", error)
+      const errorMessage =
+        error instanceof Error ? error.message : String(error)
+      try {
+        connectRPCHandler.endStream(res, new Error(errorMessage))
+      } catch {
+        res.status(500).send({ error: errorMessage })
+      }
+    }
+  }
+
+  /**
+   * aiserver.v1.AiService/ReportCommitAiAnalytics — accept commit analytics so
+   * Cursor does not fail after commit.
+   */
+  @Post("aiserver.v1.AiService/ReportCommitAiAnalytics")
+  handleReportCommitAiAnalytics(
+    @Req() req: FastifyRequest,
+    @Res() res: FastifyReply
+  ): void {
+    const payload = connectRPCHandler.stripEnvelope(req.body as Buffer)
+    const report = fromBinary(ReportCommitAiAnalyticsRequestSchema, payload)
+
+    this.logger.log(
+      `>>> AiService/ReportCommitAiAnalytics commit=${report.commitHash} source=${report.commitSource || "(none)"} added=${report.totalLinesAdded} deleted=${report.totalLinesDeleted}`
+    )
+
+    res.header("Content-Type", "application/proto")
+    res.header("Connect-Protocol-Version", "1")
+    const response = create(ReportCommitAiAnalyticsResponseSchema, {})
+    res
+      .status(200)
+      .send(
+        Buffer.from(toBinary(ReportCommitAiAnalyticsResponseSchema, response))
+      )
+  }
+
   // ── Helpers ──────────────────────────────────────────────────────────
 
   /**
@@ -303,5 +481,313 @@ export class CursorAdapterController {
     }
 
     return parts.join("\n")
+  }
+
+  private async generateBugBotReview(request: StreamBugBotRequest): Promise<{
+    summary: string
+    bugReports: ReturnType<typeof create<typeof BugReportsSchema>>
+  }> {
+    const primaryModel = request.modelDetails?.modelName || "gpt-5.4"
+    const diffText = this.buildUnifiedDiffFromGitDiff(
+      request.gitDiff?.diffs || []
+    )
+    const contextText = this.buildBugBotContextText(request.contextFiles)
+    const systemPrompt = this.buildBugBotSystemPrompt(request)
+    const userPrompt = this.buildBugBotUserPrompt(
+      request,
+      diffText,
+      contextText
+    )
+
+    // Fallback chain: Primary -> Claude -> Gemini
+    const fallbackModels = [
+      primaryModel,
+      ...CursorAdapterController.BUGBOT_FALLBACK_MODELS,
+    ]
+
+    let lastError: unknown
+
+    for (const model of fallbackModels) {
+      try {
+        this.logger.log(`Attempting BugBot review with model: ${model}`)
+        const dto: CreateMessageDto = {
+          model,
+          messages: [{ role: "user", content: userPrompt }],
+          system: systemPrompt,
+          max_tokens: request.deepReview ? 8192 : 4096,
+          temperature: 0.2,
+          stream: false,
+          thinking: {
+            type: "enabled",
+            budget_tokens: request.deepReview ? 4096 : 2048,
+          },
+        }
+
+        const response = await this.messagesService.createMessage(dto)
+        const parsed = this.parseBugBotResponse(response)
+
+        const bugReports = create(BugReportsSchema, {
+          bugReports: parsed.bugs.map((bug, index) =>
+            create(BugReportSchema, {
+              id: `bugbot-${index + 1}`,
+              title: bug.title,
+              description: bug.description,
+              rationale: bug.rationale,
+              severity: bug.severity,
+              confidence: bug.confidence,
+              category: bug.category,
+              locations: bug.locations.map((location) =>
+                create(BugLocationSchema, {
+                  file: location.file,
+                  startLine: location.startLine,
+                  endLine: location.endLine,
+                  codeLines: location.codeLines,
+                })
+              ),
+            })
+          ),
+        })
+
+        const summary =
+          parsed.summary ||
+          (bugReports.bugReports.length > 0
+            ? `Found ${bugReports.bugReports.length} potential issue(s) in the reviewed changes.`
+            : "No obvious issues found in the reviewed changes.")
+
+        return { summary, bugReports }
+      } catch (error) {
+        this.logger.warn(
+          `BugBot review failed with model ${model}: ${error instanceof Error ? error.message : String(error)}`
+        )
+        lastError = error
+        // Continue to the next model in the fallback chain
+      }
+    }
+
+    // If all models fail, throw the last error
+    throw lastError
+  }
+
+  private buildUnifiedDiffFromGitDiff(diffs: FileDiff[]): string {
+    const parts: string[] = []
+
+    for (const file of diffs) {
+      parts.push(`--- a/${file.from || file.to}`)
+      parts.push(`+++ b/${file.to || file.from}`)
+
+      for (const chunk of file.chunks) {
+        const oldStart = chunk.oldStart ?? 1
+        const oldCount = chunk.oldLines ?? chunk.lines?.length ?? 1
+        const newStart = chunk.newStart ?? 1
+        const newCount = chunk.newLines ?? chunk.lines?.length ?? 1
+        parts.push(`@@ -${oldStart},${oldCount} +${newStart},${newCount} @@`)
+
+        if (chunk.lines.length > 0) {
+          parts.push(...chunk.lines)
+        } else if (chunk.content) {
+          parts.push(chunk.content)
+        }
+      }
+    }
+
+    return parts.join("\n")
+  }
+
+  private buildBugBotContextText(contextFiles?: CodeBlock[]): string {
+    if (!contextFiles || contextFiles.length === 0) return ""
+
+    return contextFiles
+      .map((file) => {
+        const body =
+          file.overrideContents || file.contents || file.fileContents || ""
+        return [`File: ${file.relativeWorkspacePath}`, "```", body, "```"].join(
+          "\n"
+        )
+      })
+      .join("\n\n")
+  }
+
+  private buildBugBotSystemPrompt(request: StreamBugBotRequest): string {
+    const extraGuidance = [
+      request.userInstructions,
+      request.bugDetectionGuidelines,
+      request.deepReview
+        ? "Perform a deeper review and call out subtle correctness, state, concurrency, and integration risks."
+        : undefined,
+    ]
+      .filter(Boolean)
+      .join("\n\n")
+
+    return [
+      "You are Cursor BugBot, an expert code reviewer focused on identifying real bugs in a git diff.",
+      "Return ONLY valid JSON.",
+      "Use this exact schema:",
+      '{"summary":"string","bugs":[{"title":"string","description":"string","rationale":"string","severity":"critical|high|medium|low","confidence":0.0,"category":"string","locations":[{"file":"string","startLine":1,"endLine":1,"codeLines":["string"]}]}]}',
+      "Rules:",
+      "- Report only issues that are plausibly real defects or regressions.",
+      '- If there are no meaningful issues, return {"summary":"...","bugs":[] }.',
+      "- Keep each bug concise and actionable.",
+      "- Use file paths and line ranges from the provided diff/context when possible.",
+      extraGuidance,
+    ]
+      .filter(Boolean)
+      .join("\n\n")
+  }
+
+  private buildBugBotUserPrompt(
+    request: StreamBugBotRequest,
+    diffText: string,
+    contextText: string
+  ): string {
+    const constraints: string[] = []
+    if (request.constrainToFile) {
+      constraints.push(`Focus file: ${request.constrainToFile}`)
+    }
+    if (request.constrainToRange) {
+      constraints.push(
+        `Focus range: ${request.constrainToRange.startLine}-${request.constrainToRange.endLineInclusive}`
+      )
+    }
+
+    return [
+      "Review the following git diff and report likely bugs.",
+      constraints.length > 0 ? constraints.join("\n") : undefined,
+      "Git diff:",
+      "```diff",
+      diffText || "(empty diff)",
+      "```",
+      contextText ? `Additional context:\n${contextText}` : undefined,
+    ]
+      .filter(Boolean)
+      .join("\n\n")
+  }
+
+  private parseBugBotResponse(response: AnthropicResponse): {
+    summary: string
+    bugs: Array<{
+      title: string
+      description: string
+      rationale: string
+      severity: string
+      confidence?: number
+      category?: string
+      locations: Array<{
+        file: string
+        startLine: number
+        endLine: number
+        codeLines: string[]
+      }>
+    }>
+  } {
+    const text = response.content
+      .filter(
+        (
+          block
+        ): block is Extract<
+          AnthropicResponse["content"][number],
+          { type: "text" }
+        > => block.type === "text"
+      )
+      .map((block) => block.text)
+      .join("\n")
+      .trim()
+
+    const candidate = this.extractJsonObject(text)
+    if (!candidate) {
+      throw new Error("Failed to extract JSON object from model response")
+    }
+
+    try {
+      const parsed = JSON.parse(candidate) as {
+        summary?: unknown
+        bugs?: Array<{
+          title?: unknown
+          description?: unknown
+          rationale?: unknown
+          severity?: unknown
+          confidence?: unknown
+          category?: unknown
+          locations?: Array<{
+            file?: unknown
+            startLine?: unknown
+            endLine?: unknown
+            codeLines?: unknown
+          }>
+        }>
+      }
+
+      return {
+        summary:
+          typeof parsed.summary === "string"
+            ? parsed.summary
+            : "BugBot review completed.",
+        bugs: Array.isArray(parsed.bugs)
+          ? parsed.bugs
+              .map((bug) => ({
+                title:
+                  typeof bug.title === "string" && bug.title.trim()
+                    ? bug.title.trim()
+                    : "Potential issue",
+                description:
+                  typeof bug.description === "string" ? bug.description : "",
+                rationale:
+                  typeof bug.rationale === "string" ? bug.rationale : "",
+                severity:
+                  typeof bug.severity === "string" ? bug.severity : "medium",
+                confidence:
+                  typeof bug.confidence === "number"
+                    ? bug.confidence
+                    : undefined,
+                category:
+                  typeof bug.category === "string" ? bug.category : undefined,
+                locations: Array.isArray(bug.locations)
+                  ? bug.locations
+                      .map((location) => ({
+                        file:
+                          typeof location.file === "string"
+                            ? location.file
+                            : "",
+                        startLine:
+                          typeof location.startLine === "number"
+                            ? location.startLine
+                            : 1,
+                        endLine:
+                          typeof location.endLine === "number"
+                            ? location.endLine
+                            : typeof location.startLine === "number"
+                              ? location.startLine
+                              : 1,
+                        codeLines: Array.isArray(location.codeLines)
+                          ? location.codeLines.filter(
+                              (line): line is string => typeof line === "string"
+                            )
+                          : [],
+                      }))
+                      .filter((location) => location.file)
+                  : [],
+              }))
+              .filter((bug) => bug.description || bug.locations.length > 0)
+          : [],
+      }
+    } catch (error) {
+      throw new Error(
+        `Failed to parse BugBot JSON response: ${error instanceof Error ? error.message : String(error)}`
+      )
+    }
+  }
+
+  private extractJsonObject(text: string): string | null {
+    const fencedMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/i)
+    if (fencedMatch?.[1]) {
+      return fencedMatch[1].trim()
+    }
+
+    const start = text.indexOf("{")
+    const end = text.lastIndexOf("}")
+    if (start >= 0 && end > start) {
+      return text.slice(start, end + 1)
+    }
+
+    return null
   }
 }

@@ -1,5 +1,6 @@
 import { Module } from "@nestjs/common"
 import { HistoryModule } from "../../context/history.module"
+import { AnthropicModule } from "../anthropic/anthropic.module"
 import { CodexModule } from "../../llm/codex/codex.module"
 import { GoogleModule } from "../../llm/google/google.module"
 import { ModelModule } from "../../llm/model.module"
@@ -17,6 +18,7 @@ import { SemanticSearchProviderService } from "./semantic-search-provider.servic
 
 @Module({
   imports: [
+    AnthropicModule,
     CodexModule,
     GoogleModule,
     HistoryModule,

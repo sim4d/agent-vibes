@@ -5,6 +5,16 @@ import {
   resolveCloudCodeModel,
 } from "./model-registry"
 
+function isGptThinkingModel(model: string): boolean {
+  const normalized = model.toLowerCase().trim()
+  return (
+    normalized.startsWith("o3") ||
+    normalized.startsWith("o4") ||
+    normalized.startsWith("gpt-5") ||
+    normalized.startsWith("codex")
+  )
+}
+
 /**
  * Backend types for routing.
  * - google: Gemini-family models via Google Cloud Code
@@ -21,6 +31,11 @@ export interface ModelRouteResult {
   backend: BackendType
   model: string
   isThinking: boolean
+}
+
+export interface GptBackendCandidates {
+  primary: ModelRouteResult
+  fallbacks: ModelRouteResult[]
 }
 
 @Injectable()
@@ -72,7 +87,11 @@ export class ModelRouterService {
     )
     this.logger.log("=== Routing Decision ===")
     this.logger.log("  Gemini/Claude models -> Google backend")
-    if (this.openaiCompatAvailable) {
+    if (this.openaiCompatAvailable && this.codexAvailable) {
+      this.logger.log(
+        "  GPT/O-series models  -> OpenAI-compatible backend (priority, Codex fallback)"
+      )
+    } else if (this.openaiCompatAvailable) {
       this.logger.log(
         "  GPT/O-series models  -> OpenAI-compatible backend (priority)"
       )
@@ -97,6 +116,146 @@ export class ModelRouterService {
     return this.openaiCompatAvailable
   }
 
+  private buildGptBackendCandidatesFromTarget(target: {
+    model: string
+    isThinking: boolean
+  }): GptBackendCandidates | null {
+    const candidates: ModelRouteResult[] = []
+
+    if (this.openaiCompatAvailable) {
+      candidates.push({
+        backend: "openai-compat",
+        model: target.model,
+        isThinking: target.isThinking,
+      })
+    }
+
+    if (this.codexAvailable) {
+      candidates.push({
+        backend: "codex",
+        model: target.model,
+        isThinking: target.isThinking,
+      })
+    }
+
+    if (candidates.length === 0) {
+      return null
+    }
+
+    return {
+      primary: candidates[0]!,
+      fallbacks: candidates.slice(1),
+    }
+  }
+
+  private resolveGptTarget(cursorModel: string): {
+    model: string
+    isThinking: boolean
+  } | null {
+    const normalized = cursorModel.toLowerCase().trim()
+    const entry = resolveCloudCodeModel(normalized)
+
+    if (entry?.family === "gpt") {
+      return {
+        model: entry.cloudCodeId,
+        isThinking: entry.isThinking,
+      }
+    }
+
+    if (detectModelFamily(normalized) !== "gpt") {
+      return null
+    }
+
+    return {
+      model: normalized,
+      isThinking: isGptThinkingModel(normalized),
+    }
+  }
+
+  getGptBackendCandidates(cursorModel: string): GptBackendCandidates | null {
+    const target = this.resolveGptTarget(cursorModel)
+    if (!target) {
+      return null
+    }
+    return this.buildGptBackendCandidatesFromTarget(target)
+  }
+
+  getFallbackRoute(
+    cursorModel: string,
+    currentBackend: BackendType
+  ): ModelRouteResult | null {
+    const candidates = this.getGptBackendCandidates(cursorModel)
+    if (!candidates) {
+      return null
+    }
+
+    const ordered = [candidates.primary, ...candidates.fallbacks]
+    return (
+      ordered.find((candidate) => candidate.backend !== currentBackend) || null
+    )
+  }
+
+  private parseBackendErrorStatus(error: unknown): number | null {
+    const message =
+      error instanceof Error
+        ? error.message
+        : typeof error === "string"
+          ? error
+          : ""
+    const match = message.match(/(?:api error|status=|status\s)(\d{3})/i)
+    if (!match?.[1]) {
+      return null
+    }
+
+    const status = Number.parseInt(match[1], 10)
+    return Number.isFinite(status) ? status : null
+  }
+
+  shouldFallbackFromBackend(
+    error: unknown,
+    currentBackend: BackendType,
+    fallbackBackend?: BackendType
+  ): boolean {
+    if (!fallbackBackend) {
+      return false
+    }
+
+    if (
+      (currentBackend !== "openai-compat" && currentBackend !== "codex") ||
+      (fallbackBackend !== "openai-compat" && fallbackBackend !== "codex")
+    ) {
+      return false
+    }
+
+    const message =
+      error instanceof Error
+        ? error.message.toLowerCase()
+        : typeof error === "string"
+          ? error.toLowerCase()
+          : ""
+    const status = this.parseBackendErrorStatus(error)
+
+    if (status != null) {
+      if ([401, 403, 404, 408, 409, 429, 500, 502, 503, 504].includes(status)) {
+        return true
+      }
+
+      if (status === 400) {
+        return /model|provider|upstream|quota|rate limit|unavailable|unsupported|overloaded|temporar/.test(
+          message
+        )
+      }
+
+      if (status === 422) {
+        return false
+      }
+    }
+
+    return /timeout|timed out|fetch failed|socket hang up|econn|enotfound|eai_again|network|html page|anti-bot|captcha|blocked|not configured|missing api key|missing base url|no available providers|temporarily unavailable|service unavailable|quota|rate limit/.test(
+      message
+    )
+  }
+
   /**
    * Resolve model to appropriate backend.
    * Uses unified model-registry for all name resolution.
@@ -105,30 +264,21 @@ export class ModelRouterService {
     const normalized = cursorModel.toLowerCase().trim()
     const family = detectModelFamily(normalized)
     const entry = resolveCloudCodeModel(normalized)
+    const gptCandidates = this.getGptBackendCandidates(cursorModel)
 
     // 1. Known model with registry entry
     if (entry) {
-      // GPT family → openai-compat (priority) > codex > google fallback
+      // GPT family → openai-compat (priority) > codex
       if (entry.family === "gpt") {
-        if (this.openaiCompatAvailable) {
+        if (gptCandidates) {
+          const route = gptCandidates.primary
+          const fallbackSuffix = gptCandidates.fallbacks.length
+            ? ` | fallback=${gptCandidates.fallbacks.map((candidate) => candidate.backend).join(",")}`
+            : ""
           this.logger.log(
-            `[ROUTE] ${cursorModel} -> OpenAI-compat | ${entry.cloudCodeId}`
+            `[ROUTE] ${cursorModel} -> ${route.backend} | ${entry.cloudCodeId}${fallbackSuffix}`
           )
-          return {
-            backend: "openai-compat",
-            model: entry.cloudCodeId,
-            isThinking: entry.isThinking,
-          }
-        }
-        if (this.codexAvailable) {
-          this.logger.log(
-            `[ROUTE] ${cursorModel} -> Codex | ${entry.cloudCodeId}`
-          )
-          return {
-            backend: "codex",
-            model: entry.cloudCodeId,
-            isThinking: entry.isThinking,
-          }
+          return route
         }
 
         throw new Error(
@@ -163,31 +313,19 @@ export class ModelRouterService {
       }
     }
 
-    // 3. GPT family -> openai-compat > codex > google fallback
+    // 3. GPT family -> openai-compat > codex
     if (family === "gpt") {
-      const isThinkingModel =
-        normalized.startsWith("o3") ||
-        normalized.startsWith("o4") ||
-        normalized.startsWith("codex")
-
-      if (this.openaiCompatAvailable) {
+      if (gptCandidates) {
+        const route = gptCandidates.primary
+        const fallbackSuffix = gptCandidates.fallbacks.length
+          ? ` | fallback=${gptCandidates.fallbacks.map((candidate) => candidate.backend).join(",")}`
+          : ""
         this.logger.log(
-          `[ROUTE] ${cursorModel} -> OpenAI-compat | ${normalized}`
+          `[ROUTE] ${cursorModel} -> ${route.backend} | ${route.model}${fallbackSuffix}`
         )
-        return {
-          backend: "openai-compat",
-          model: normalized,
-          isThinking: isThinkingModel,
-        }
+        return route
       }
-      if (this.codexAvailable) {
-        this.logger.log(`[ROUTE] ${cursorModel} -> Codex | ${normalized}`)
-        return {
-          backend: "codex",
-          model: normalized,
-          isThinking: isThinkingModel,
-        }
-      }
+
       throw new Error(
         `No GPT backend available for model ${cursorModel}. ` +
           `Configure OPENAI_COMPAT_BASE_URL + OPENAI_COMPAT_API_KEY or CODEX_API_KEY.`

@@ -122,8 +122,24 @@ export class CodexService implements OnModuleInit {
       this.baseUrl = DEFAULT_BASE_URL
     }
 
-    // If access token is provided, set it in the auth service
-    if (this.accessToken) {
+    // Load persisted tokens FIRST — they survive restarts and may contain
+    // rotated refresh tokens that the env vars do not have.
+    const persisted = this.authService.loadPersistedTokens()
+
+    if (persisted?.refreshToken) {
+      // Persisted token file exists and has a refresh token.
+      // Use it regardless of whether CODEX_ACCESS_TOKEN env var is set;
+      // this is the primary path for OAuth setups surviving restarts.
+      this.logger.log(
+        "Using persisted Codex tokens (with rotated refresh token)"
+      )
+      this.authService.setTokenData(persisted)
+      // Ensure isAvailable() returns true even without the env var
+      if (!this.accessToken && persisted.accessToken) {
+        this.accessToken = persisted.accessToken
+      }
+    } else if (this.accessToken) {
+      // No persisted tokens — fall back to env-var-based initialization
       this.authService.setTokenData({
         idToken: this.configService.get<string>("CODEX_ID_TOKEN", "").trim(),
         accessToken: this.accessToken,
@@ -149,7 +165,7 @@ export class CodexService implements OnModuleInit {
     )
     if (!hasCredentials) {
       this.logger.warn(
-        "No Codex credentials configured (CODEX_API_KEY or CODEX_ACCESS_TOKEN). " +
+        "No Codex credentials configured (CODEX_API_KEY or CODEX_ACCESS_TOKEN or persisted tokens). " +
           "GPT/O-series models will not be available."
       )
     }

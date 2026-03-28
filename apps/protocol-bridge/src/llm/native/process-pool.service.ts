@@ -108,6 +108,8 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
   private readonly workers: WorkerHandle[] = []
   private currentWorkerIndex = -1
   private requestCounter = 0
+  /** Timeout for non-streaming generation (deep thinking models may take long) */
+  private readonly GENERATE_TIMEOUT_MS = 3_600_000 // 1 hour
   private antigravityNodeBinary: string | null = null
   private antigravityNodeModules: string | null = null
 
@@ -789,7 +791,13 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
     const worker = this.getNextWorker()
     worker.requestCount++
     await this.preparePayloadForWorker(worker, payload)
-    return this.sendRequest(worker, "generate", { payload })
+    // Use long timeout for non-streaming generation, especially for deep thinking models
+    return this.sendRequest(
+      worker,
+      "generate",
+      { payload },
+      this.GENERATE_TIMEOUT_MS
+    )
   }
 
   /**

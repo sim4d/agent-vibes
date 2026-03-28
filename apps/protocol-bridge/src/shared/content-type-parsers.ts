@@ -170,4 +170,26 @@ export function registerContentTypeParsers(
       })
     }
   )
+
+  // application/x-protobuf — OTLP traces exporter (OpenTelemetry)
+  fastify.addContentTypeParser(
+    "application/x-protobuf",
+    { bodyLimit: 52428800 },
+    (
+      _request: FastifyRequest,
+      payload: Readable,
+      done: (err: Error | null, body?: Buffer) => void
+    ) => {
+      const chunks: Buffer[] = []
+      payload.on("data", (chunk: Buffer) => {
+        chunks.push(chunk)
+      })
+      payload.on("end", () => {
+        done(null, Buffer.concat(chunks))
+      })
+      payload.on("error", (err: Error) => {
+        done(err)
+      })
+    }
+  )
 }
