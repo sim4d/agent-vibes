@@ -88,6 +88,8 @@ export interface ChatSession {
   pendingToolCalls: Map<string, PendingToolCall>
   // ExecServerMessage.id -> toolCallId mapping for control messages/tool results
   pendingToolCallByExecId: Map<number, string>
+  // Identifies the current BiDi stream; used to detect orphaned tool calls from closed streams
+  currentStreamId: string
 
   // Context from initial request
   projectContext?: ParsedCursorRequest["projectContext"]
@@ -146,6 +148,8 @@ export interface PendingToolCall {
   execIds: Set<number>
   editApplyWarning?: string
   beforeContent?: string // File content before edit (for edit tools)
+  // Which BiDi stream this tool call was dispatched on
+  streamId: string
   // Shell stream accumulation (for streaming shell output)
   shellStreamOutput?: {
     stdout: string[]
@@ -774,6 +778,7 @@ export class ChatSessionManager implements OnModuleDestroy {
       lastActivityAt,
       pendingToolCalls: new Map(),
       pendingToolCallByExecId: new Map(),
+      currentStreamId: crypto.randomUUID(),
       projectContext: persisted.projectContext,
       codeChunks: persisted.codeChunks,
       cursorRules: Array.isArray(persisted.cursorRules)
@@ -854,6 +859,7 @@ export class ChatSessionManager implements OnModuleDestroy {
       lastActivityAt: new Date(),
       pendingToolCalls: new Map(),
       pendingToolCallByExecId: new Map(),
+      currentStreamId: crypto.randomUUID(),
       projectContext: initialRequest?.projectContext,
       codeChunks: initialRequest?.codeChunks,
       cursorRules: initialRequest?.cursorRules,
@@ -1252,6 +1258,7 @@ export class ChatSessionManager implements OnModuleDestroy {
         sentAt: new Date(),
         execIds: new Set(),
         beforeContent,
+        streamId: session.currentStreamId,
       })
       session.lastActivityAt = new Date()
       this.logger.debug(
@@ -1383,6 +1390,51 @@ export class ChatSessionManager implements OnModuleDestroy {
     )
     this.schedulePersist(conversationId)
     return count
+  }
+
+  /**
+   * Rotate the stream ID for a session. Returns the new stream ID.
+   * Called when a new BiDi stream is established for an existing conversation.
+   */
+  rotateStreamId(conversationId: string): string {
+    const session = this.getSession(conversationId)
+    if (!session) return ""
+    const newId = crypto.randomUUID()
+    const oldId = session.currentStreamId
+    session.currentStreamId = newId
+    session.lastActivityAt = new Date()
+    this.logger.debug(
+      `Rotated streamId for ${conversationId}: ${oldId.substring(0, 8)} -> ${newId.substring(0, 8)}`
+    )
+    this.schedulePersist(conversationId)
+    return newId
+  }
+
+  /**
+   * Rebind pending tool calls to the current stream ID.
+   * This is used when a stream reconnects (e.g. resumeAction) and the tool results
+   * will arrive on the new stream.
+   * Returns the number of rebound entries.
+   */
+  rebindPendingToolCallsToCurrentStream(conversationId: string): number {
+    const session = this.getSession(conversationId)
+    if (!session || session.pendingToolCalls.size === 0) return 0
+
+    const currentStreamId = session.currentStreamId
+    let reboundCount = 0
+
+    for (const [_, pending] of session.pendingToolCalls) {
+      if (pending.streamId !== currentStreamId) {
+        pending.streamId = currentStreamId
+        reboundCount++
+      }
+    }
+
+    if (reboundCount > 0) {
+      this.schedulePersist(conversationId)
+    }
+
+    return reboundCount
   }
 
   /**

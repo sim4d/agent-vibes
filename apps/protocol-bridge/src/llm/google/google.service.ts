@@ -55,8 +55,8 @@ export class GoogleService {
   private readonly PRIME_RETRY_DELAYS = [2000, 3000, 5000] // ms between attempt retries
   private readonly BASE_RETRY_DELAY = 1200 // Base for 429 without retryDelay (ms)
   private readonly MAX_RETRY_DELAY = 60000 // Cap for exponential backoff (60s for rate limit recovery)
-  private readonly MAX_429_WAIT_MS = 5 * 60 * 1000 // Cap API retryMs (5 min), allow longer recovery
-  private readonly QUOTA_EXHAUSTED_DEFAULT_COOLDOWN_MS = 15 * 60 * 1000 // Fallback cooldown when quota exhausted but no reset time parsed (15 min)
+  private readonly MAX_429_WAIT_MS = 3 * 60 * 1000 // Cap API retryMs (3 min), allow longer recovery
+  private readonly QUOTA_EXHAUSTED_DEFAULT_COOLDOWN_MS = 3 * 60 * 1000 // Fallback cooldown when quota exhausted but no reset time parsed (aligned with MAX_429_WAIT_MS)
   private readonly MAX_PROMPT_SHRINK_RETRIES: number = 3
   private readonly CLOUD_CODE_DEFAULT_OUTPUT_TOKENS: number = 65536
   private readonly CLOUD_CODE_MAX_OUTPUT_TOKENS: number = 65536
@@ -3275,6 +3275,12 @@ export class GoogleService {
     let promptShrinkRetries = 0
 
     const attemptStream = async (): Promise<void> => {
+      // Recovery orchestration: allow ONE cooldown wait when all workers are
+      // exhausted but the shortest cooldown is within MAX_429_WAIT_MS.
+      // After recovery, the loop continues with a fresh attempt (workerAttempt
+      // is not consumed) so the recovered worker gets a fair chance.
+      let hasWaitedForRecovery = false
+
       for (
         let workerAttempt = 0;
         workerAttempt < maxWorkerRetries;
@@ -3309,23 +3315,21 @@ export class GoogleService {
             )
 
             // Check if another worker is available for this model
-            if (
-              !isLast &&
-              self.processPool.hasAvailableWorkerForModel(resolvedModel)
-            ) {
+            if (self.processPool.hasAvailableWorkerForModel(resolvedModel)) {
               self.logger.warn(
                 `Streaming 429${exhausted ? " (QUOTA_EXHAUSTED)" : ""} [${self.processPool.getLastWorkerEmail()}] (attempt ${workerAttempt + 1}/${maxWorkerRetries}), rotating to next available worker for ${resolvedModel}`
               )
               continue
             }
 
-            // All workers exhausted for this model — graceful degradation
+            // All workers exhausted for this model — check if we can wait for recovery
             const waitMs =
               self.processPool.getMinCooldownMsForModel(resolvedModel)
+
             if (waitMs > self.MAX_429_WAIT_MS) {
-              // Cooldown too long — return 429 with context instead of crashing
+              // Cooldown too long — return 429 with context
               self.logger.error(
-                `All workers quota exhausted for ${resolvedModel}, shortest cooldown: ${waitMs}ms (exceeds max wait)`
+                `All workers quota exhausted for ${resolvedModel}, shortest cooldown: ${waitMs}ms (exceeds max wait ${self.MAX_429_WAIT_MS}ms)`
               )
               throw new HttpException(
                 `All Cloud Code accounts are rate-limited for ${resolvedModel}. Retry after ${Math.ceil(waitMs / 1000)}s.`,
@@ -3333,13 +3337,25 @@ export class GoogleService {
               )
             }
 
-            if (!isLast) {
+            // Cooldown within threshold — wait for the first worker to recover
+            if (!hasWaitedForRecovery) {
+              hasWaitedForRecovery = true
               self.logger.warn(
-                `Streaming 429, all workers rate-limited for ${resolvedModel}, waiting ${waitMs}ms before retry`
+                `All workers exhausted for ${resolvedModel}, waiting ${Math.ceil(waitMs / 1000)}s for recovery (1 recovery wait allowed)`
               )
               await self.sleep(waitMs)
+              workerAttempt-- // don't consume an attempt — give recovered worker a fair chance
               continue
             }
+
+            // Already waited once — give up to avoid infinite loop
+            self.logger.error(
+              `All workers still exhausted for ${resolvedModel} after recovery wait, giving up`
+            )
+            throw new HttpException(
+              `All Cloud Code accounts are rate-limited for ${resolvedModel}. Retry after ${Math.ceil(waitMs / 1000)}s.`,
+              HttpStatus.TOO_MANY_REQUESTS
+            )
           }
 
           // 400 — prompt-too-long: shrink payload and retry

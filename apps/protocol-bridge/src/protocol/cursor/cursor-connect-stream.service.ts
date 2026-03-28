@@ -5884,6 +5884,9 @@ ${raw}
               `Session created for conversation: ${conversationId}`
             )
 
+            // Rotate the stream ID so we can detect orphaned tool calls from closed streams
+            this.sessionManager.rotateStreamId(conversationId)
+
             // Agent mode: send initial KV messages only for fresh user-message turns.
             // resume_action carries no new prompt and should not emit synthetic user_query.
             if (parsed.isAgentic && parsed.newMessage) {
@@ -5985,10 +5988,29 @@ ${raw}
             sessionBeforeRun &&
             sessionBeforeRun.pendingToolCalls.size > 0
           ) {
+            // Rebind the pending tool calls to the current stream ID, since
+            // the tool results will arrive on this new stream.
+            const reboundCount =
+              this.sessionManager.rebindPendingToolCallsToCurrentStream(
+                conversationId!
+              )
+            if (reboundCount > 0) {
+              this.logger.log(
+                `resumeAction: rebound ${reboundCount} pending tool call(s) to current stream`
+              )
+            }
+            // Re-check: if there are still pending tool calls on the CURRENT stream, wait
+            const stillPending = this.sessionManager.getSession(conversationId!)
+            if (stillPending && stillPending.pendingToolCalls.size > 0) {
+              this.logger.log(
+                `resumeAction attached to stream, waiting for ${stillPending.pendingToolCalls.size} pending tool result(s)`
+              )
+              continue
+            }
+            // No pending tool calls remain — fall through to handle as new turn
             this.logger.log(
-              `resumeAction attached to stream, waiting for ${sessionBeforeRun.pendingToolCalls.size} pending tool result(s)`
+              `resumeAction: no pending tool calls remain, proceeding as new turn`
             )
-            continue
           }
           if (sessionBeforeRun && sessionBeforeRun.pendingToolCalls.size > 0) {
             // Stale pending tool calls from a previous (now-closed) BiDi stream.
