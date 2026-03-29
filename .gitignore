@@ -25,6 +25,8 @@ apps/protocol-bridge/data/accounts.local.json
 apps/protocol-bridge/data/antigravity-accounts.json
 apps/protocol-bridge/data/codex-accounts.json
 apps/protocol-bridge/data/openai-compat-accounts.json
+apps/protocol-bridge/data/openai-compat-account-state.json
+data/openai-compat-account-state.json
 apps/protocol-bridge/proto/
 scripts/cursor/
 backups/

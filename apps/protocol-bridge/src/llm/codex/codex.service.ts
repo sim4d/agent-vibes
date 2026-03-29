@@ -33,11 +33,16 @@ import type { AnthropicResponse } from "../../shared/anthropic"
 import { CodexModelTier, normalizeCodexModelTier } from "../model-registry"
 import {
   type CooldownableAccount,
+  isAccountDisabled,
   markAccountCooldown,
   markAccountSuccess,
   pickAvailableAccount,
   getEarliestRecovery,
 } from "../shared/account-cooldown"
+import {
+  BackendPoolEntryState,
+  BackendPoolStatus,
+} from "../shared/backend-pool-status"
 import { CodexAuthService, type CodexTokenData } from "./codex-auth.service"
 import { CodexCacheService } from "./codex-cache.service"
 import { translateClaudeToCodex } from "./codex-request-translator"
@@ -308,6 +313,51 @@ export class CodexService implements OnModuleInit {
     return this.accounts.length > 0
   }
 
+  getPoolStatus(): BackendPoolStatus {
+    const now = Date.now()
+    const entries = this.accounts.map((account) => {
+      const modelCooldowns = this.getActiveModelCooldowns(account, now)
+      const state = this.getPoolEntryState(account, modelCooldowns, now)
+      return {
+        id: [
+          account.email || "",
+          account.accountId || "",
+          account.apiKey || "",
+          account.baseUrl,
+        ].join("\0"),
+        label: this.getAccountLabel(account),
+        state,
+        cooldownUntil: account.cooldownUntil,
+        disabledAt: account.disabledAt,
+        disabledReason: account.disabledReason,
+        source: account.source,
+        baseUrl: account.baseUrl,
+        proxyUrl: account.proxyUrl,
+        planType: account.planType,
+        email: account.email,
+        accountId: account.accountId,
+        modelCooldowns,
+      }
+    })
+
+    return {
+      backend: "codex",
+      kind: "account-pool",
+      configured: this.accounts.length > 0,
+      total: entries.length,
+      available: entries.filter(
+        (entry) => entry.state === "ready" || entry.state === "degraded"
+      ).length,
+      ready: entries.filter((entry) => entry.state === "ready").length,
+      degraded: entries.filter((entry) => entry.state === "degraded").length,
+      cooling: entries.filter((entry) => entry.state === "cooldown").length,
+      disabled: entries.filter((entry) => entry.state === "disabled").length,
+      unavailable: 0,
+      configPath: this.accountsFilePath,
+      entries,
+    }
+  }
+
   getModelTier(): CodexModelTier | null {
     return this.getHighestLoadedModelTier() || this.configuredModelTier
   }
@@ -459,6 +509,38 @@ export class CodexService implements OnModuleInit {
 
   private getAccountLabel(slot: CodexAccountSlot): string {
     return slot.label || slot.email || "slot"
+  }
+
+  private getActiveModelCooldowns(
+    account: CodexAccountSlot,
+    now: number
+  ): BackendPoolStatus["entries"][number]["modelCooldowns"] {
+    return Array.from(account.modelStates.entries())
+      .filter(([, state]) => state.cooldownUntil > now)
+      .map(([model, state]) => ({
+        model,
+        cooldownUntil: state.cooldownUntil,
+        quotaExhausted: state.quotaExhausted,
+        backoffLevel: state.backoffLevel,
+      }))
+      .sort((left, right) => left.cooldownUntil - right.cooldownUntil)
+  }
+
+  private getPoolEntryState(
+    account: CodexAccountSlot,
+    modelCooldowns: BackendPoolStatus["entries"][number]["modelCooldowns"],
+    now: number
+  ): BackendPoolEntryState {
+    if (isAccountDisabled(account)) {
+      return "disabled"
+    }
+    if (account.cooldownUntil > now) {
+      return "cooldown"
+    }
+    if (modelCooldowns.length > 0) {
+      return "degraded"
+    }
+    return "ready"
   }
 
   /**

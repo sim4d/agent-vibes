@@ -47,6 +47,7 @@ lerna-debug.log*
 # Antigravity account credentials
 data/accounts.json
 data/accounts.local.json
+data/openai-compat-account-state.json
 
 # temp directory
 .temp

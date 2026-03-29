@@ -10,6 +10,10 @@ import * as fs from "fs"
 import * as os from "os"
 import * as path from "path"
 import * as readline from "readline"
+import {
+  BackendPoolEntryState,
+  BackendPoolStatus,
+} from "../shared/backend-pool-status"
 
 /**
  * Account configuration for a native worker process
@@ -1105,6 +1109,60 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
         requestCount: w.requestCount,
         pid: w.process.pid,
       })),
+    }
+  }
+
+  getPoolStatus(): BackendPoolStatus {
+    const now = Date.now()
+    const entries = this.workers.map((worker) => {
+      const modelCooldowns = Array.from(worker.modelStates.entries())
+        .filter(([, state]) => state.cooldownUntil > now)
+        .map(([model, state]) => ({
+          model,
+          cooldownUntil: state.cooldownUntil,
+          quotaExhausted: state.quotaExhausted,
+        }))
+        .sort((left, right) => left.cooldownUntil - right.cooldownUntil)
+
+      let state: BackendPoolEntryState
+      if (!worker.ready) {
+        state = "unavailable"
+      } else if (worker.cooldownUntil > now) {
+        state = "cooldown"
+      } else if (modelCooldowns.length > 0) {
+        state = "degraded"
+      } else {
+        state = "ready"
+      }
+
+      return {
+        id: worker.account.email,
+        label: worker.account.email,
+        state,
+        cooldownUntil: worker.cooldownUntil,
+        email: worker.account.email,
+        ready: worker.ready,
+        requestCount: worker.requestCount,
+        pid: worker.process.pid,
+        modelCooldowns,
+      }
+    })
+
+    return {
+      backend: "google",
+      kind: "native-worker-pool",
+      configured: this.workers.length > 0,
+      total: entries.length,
+      available: entries.filter(
+        (entry) => entry.state === "ready" || entry.state === "degraded"
+      ).length,
+      ready: entries.filter((entry) => entry.state === "ready").length,
+      degraded: entries.filter((entry) => entry.state === "degraded").length,
+      cooling: entries.filter((entry) => entry.state === "cooldown").length,
+      disabled: 0,
+      unavailable: entries.filter((entry) => entry.state === "unavailable")
+        .length,
+      entries,
     }
   }
 }
