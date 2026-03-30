@@ -123,6 +123,13 @@ if (command === "sync") {
 }
 
 if (command === "cert") {
+  const GREEN = "\x1b[0;32m"
+  const RED = "\x1b[0;31m"
+  const YELLOW = "\x1b[1;33m"
+  const CYAN = "\x1b[0;36m"
+  const DIM = "\x1b[2m"
+  const NC = "\x1b[0m"
+
   // Verify mkcert is available
   const mkcertCheck = spawnSync(
     process.platform === "win32" ? "where" : "which",
@@ -130,24 +137,81 @@ if (command === "cert") {
     { encoding: "utf-8", stdio: "pipe" }
   )
   if (mkcertCheck.status !== 0) {
-    console.error("Error: mkcert is not installed or not in PATH.\n")
+    console.error(`${RED}Error: mkcert is not installed or not in PATH.${NC}\n`)
     if (process.platform === "darwin") {
-      console.error("  Install with: brew install mkcert && mkcert -install")
+      console.error("  Install with: brew install mkcert")
     } else if (process.platform === "win32") {
       console.error("  Install with: choco install mkcert  (or scoop install mkcert)")
-      console.error("  Then run: mkcert -install")
     } else {
       console.error("  Install with: sudo apt install mkcert  (or see https://github.com/FiloSottile/mkcert)")
-      console.error("  Then run: mkcert -install")
     }
     process.exit(1)
   }
 
+  // ── Step 1: Auto-install mkcert CA if not yet installed ──────────────
+  const caRoot = spawnSync("mkcert", ["-CAROOT"], {
+    encoding: "utf-8",
+    stdio: "pipe",
+  }).stdout.trim()
+
+  const caRootPem = path.join(caRoot, "rootCA.pem")
+  const caInstalled = fs.existsSync(caRootPem)
+
+  if (!caInstalled) {
+    console.log(`\n${CYAN}▸ Installing mkcert local CA...${NC}`)
+  } else {
+    console.log(`\n${CYAN}▸ Ensuring mkcert local CA is installed in trust store...${NC}`)
+  }
+  const installResult = spawnSync("mkcert", ["-install"], {
+    stdio: "inherit",
+    encoding: "utf-8",
+  })
+  if (installResult.status !== 0) {
+    console.error(`${RED}✗ mkcert -install failed. You may need to run it manually.${NC}`)
+  }
+
+  // ── Step 2: macOS — Verify & remediate CA trust in System Keychain ──
+  if (process.platform === "darwin" && fs.existsSync(caRootPem)) {
+    console.log(`\n${CYAN}▸ Verifying CA trust in macOS Keychain...${NC}`)
+
+    // Check if CA is trusted using security verify-cert
+    const verifyResult = spawnSync("security", ["verify-cert", "-c", caRootPem], {
+      encoding: "utf-8",
+      stdio: "pipe",
+    })
+
+    if (verifyResult.status !== 0) {
+      console.log(`${YELLOW}⚠ CA not fully trusted by macOS. Attempting to fix...${NC}`)
+
+      // Try to add to System keychain with explicit trust
+      const addResult = spawnSync("sudo", [
+        "security", "add-trusted-cert",
+        "-d",             // admin trust domain
+        "-r", "trustRoot",
+        "-k", "/Library/Keychains/System.keychain",
+        caRootPem,
+      ], { stdio: "inherit" })
+
+      if (addResult.status === 0) {
+        console.log(`${GREEN}✓${NC} CA added to System Keychain as trusted root`)
+      } else {
+        console.log(`${YELLOW}⚠ Automatic trust failed (macOS Sonoma+ may require manual approval).${NC}`)
+        console.log(`  Please open Keychain Access, find "mkcert" in System keychain,`)
+        console.log(`  double-click → Trust → set "When using this certificate" to "Always Trust"`)
+      }
+    } else {
+      console.log(`${GREEN}✓${NC} CA is trusted by macOS`)
+    }
+  }
+
+  // ── Step 3: Generate certificates ───────────────────────────────────
+  console.log(`\n${CYAN}▸ Generating SSL certificates...${NC}`)
   const certDir = path.join(ROOT, "apps", "protocol-bridge", "certs")
   if (!fs.existsSync(certDir)) {
     fs.mkdirSync(certDir, { recursive: true })
   }
-  run(
+
+  const mkcertResult = spawnSync(
     "mkcert",
     [
       "-cert-file",
@@ -190,8 +254,125 @@ if (command === "cert") {
       "127.0.0.3",
       "::1",
     ],
-    { cwd: certDir }
+    { cwd: certDir, stdio: "inherit" }
   )
+  if (mkcertResult.status !== 0) {
+    console.error(`${RED}✗ Certificate generation failed${NC}`)
+    process.exit(1)
+  }
+
+  // ── Step 4: Configure NODE_EXTRA_CA_CERTS for Electron/Node.js ──────
+  // Electron's Node.js layer (Extension Host, gRPC client) does NOT read
+  // macOS System Keychain. It needs NODE_EXTRA_CA_CERTS to trust mkcert CA.
+  if (fs.existsSync(caRootPem)) {
+    console.log(`\n${CYAN}▸ Configuring NODE_EXTRA_CA_CERTS for Cursor (Electron/Node.js)...${NC}`)
+
+    const exportLine = `export NODE_EXTRA_CA_CERTS="${caRootPem}"`
+    let configured = false
+
+    // Detect shell profile
+    const home = process.env.HOME || process.env.USERPROFILE || ""
+    const shellProfiles = process.platform === "win32"
+      ? [] // Windows: handled separately
+      : [
+          path.join(home, ".zshrc"),
+          path.join(home, ".bashrc"),
+          path.join(home, ".bash_profile"),
+        ]
+
+    for (const profile of shellProfiles) {
+      if (!fs.existsSync(profile)) continue
+
+      const content = fs.readFileSync(profile, "utf-8")
+      if (content.includes("NODE_EXTRA_CA_CERTS") && content.includes(caRootPem)) {
+        console.log(`${GREEN}✓${NC} NODE_EXTRA_CA_CERTS already configured in ${path.basename(profile)}`)
+        configured = true
+        break
+      }
+    }
+
+    if (!configured) {
+      // Find the first existing shell profile to append to
+      const targetProfile = shellProfiles.find((p) => fs.existsSync(p))
+
+      if (targetProfile) {
+        const marker = "# Added by agent-vibes cert (Electron/Node.js CA trust)"
+        const block = `\n${marker}\n${exportLine}\n`
+
+        // Check if we already have our marker (with possibly outdated path)
+        const content = fs.readFileSync(targetProfile, "utf-8")
+        if (content.includes(marker)) {
+          // Replace existing block
+          const updated = content.replace(
+            new RegExp(`\n${marker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\n[^\\n]*\\n`),
+            block
+          )
+          fs.writeFileSync(targetProfile, updated)
+        } else {
+          fs.appendFileSync(targetProfile, block)
+        }
+        console.log(`${GREEN}✓${NC} Added NODE_EXTRA_CA_CERTS to ${path.basename(targetProfile)}`)
+        console.log(`  ${DIM}Run: source ~/${path.basename(targetProfile)}${NC}`)
+      } else if (process.platform !== "win32") {
+        console.log(`${YELLOW}⚠${NC} Could not find shell profile. Please add manually:`)
+        console.log(`  ${exportLine}`)
+      }
+
+      if (process.platform === "win32") {
+        console.log(`${YELLOW}▸${NC} Windows: Set environment variable manually:`)
+        console.log(`  setx NODE_EXTRA_CA_CERTS "${caRootPem}"`)
+      }
+    }
+
+    // Also set it for the current process (if server starts after cert)
+    process.env.NODE_EXTRA_CA_CERTS = caRootPem
+  }
+
+  // ── Step 5: Verification summary ────────────────────────────────────
+  const certFile = path.join(certDir, "localhost.crt")
+  const keyFile = path.join(certDir, "localhost.key")
+
+  console.log(`\n${CYAN}═══ Certificate Setup Summary ═══${NC}`)
+  console.log(`  CA Root:     ${GREEN}${caRootPem}${NC}`)
+  console.log(`  Certificate: ${fs.existsSync(certFile) ? GREEN + "✓" : RED + "✗"} ${certFile}${NC}`)
+  console.log(`  Key:         ${fs.existsSync(keyFile) ? GREEN + "✓" : RED + "✗"} ${keyFile}${NC}`)
+
+  // Verify cert matches key
+  if (fs.existsSync(certFile) && fs.existsSync(keyFile)) {
+    const certMod = spawnSync("openssl", ["x509", "-noout", "-modulus", "-in", certFile], {
+      encoding: "utf-8", stdio: "pipe",
+    })
+    const keyMod = spawnSync("openssl", ["rsa", "-noout", "-modulus", "-in", keyFile], {
+      encoding: "utf-8", stdio: "pipe",
+    })
+    if (certMod.stdout && keyMod.stdout && certMod.stdout.trim() === keyMod.stdout.trim()) {
+      console.log(`  Key Match:   ${GREEN}✓${NC} certificate and key match`)
+    } else {
+      console.log(`  Key Match:   ${RED}✗${NC} certificate and key DO NOT match!`)
+    }
+
+    // Verify cert chain against CA
+    const chainResult = spawnSync("openssl", [
+      "verify", "-CAfile", caRootPem, certFile,
+    ], { encoding: "utf-8", stdio: "pipe" })
+    if (chainResult.status === 0) {
+      console.log(`  Chain:       ${GREEN}✓${NC} certificate chain is valid`)
+    } else {
+      console.log(`  Chain:       ${RED}✗${NC} certificate chain verification failed`)
+      console.log(`  ${DIM}${(chainResult.stderr || "").trim()}${NC}`)
+    }
+  }
+
+  console.log("")
+  if (process.platform === "darwin") {
+    console.log(`${YELLOW}Important:${NC} After running this command, ${YELLOW}fully quit and restart Cursor${NC}`)
+    console.log(`(Cmd+Q, not just close window) for the certificate changes to take effect.`)
+  } else {
+    console.log(`${YELLOW}Important:${NC} Restart Cursor for the certificate changes to take effect.`)
+  }
+  console.log("")
+
+  process.exit(0)
 }
 
 if (command === "patch") {

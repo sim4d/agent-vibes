@@ -175,6 +175,24 @@ agent-vibes sync --tools
 
 - 凭据会同步到 `apps/protocol-bridge/data/antigravity-accounts.json`。
 - 支持多账号轮转。
+- **Claude 模型路由：** 当 Claude Code CLI 通过 Google 后端路由时，
+  只有 **Opus** 模型走 Claude-through-Google（Cloud Code）路径。
+  非 Opus 的 Claude 模型（Sonnet、Haiku 等）会自动重定向到
+  **Gemini 3.1 Pro High**，从而节省 Claude 配额用于复杂的 agentic 任务。
+- **配额降级（可选）：** 当所有 Google Cloud Code 账号配额耗尽，
+  且冷却时间超过最大等待阈值时，系统可以自动降级到配置的
+  Gemini 模型，而非返回 429 错误。
+  在 `antigravity-accounts.json` 顶层添加 `"quotaFallbackModel"` 即可开启：
+
+```json
+{
+  "quotaFallbackModel": "gemini-3.1-pro-high",
+  "accounts": [...]
+}
+```
+
+将 `"quotaFallbackModel"` 设为目标降级模型 ID，
+或删除该字段以禁用（默认：禁用，行为与之前一致，返回 429）。
 
 ### 2. GPT
 

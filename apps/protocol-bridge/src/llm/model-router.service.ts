@@ -275,6 +275,7 @@ export class ModelRouterService {
 
     const candidates: ModelRouteResult[] = []
     const entry = resolveCloudCodeModel(normalized)
+    const isOpus = isOpusModel(normalized)
 
     // Claude API can expose aliases such as "latest" that do not match
     // the registry/family heuristics, so honor explicit support first.
@@ -287,23 +288,33 @@ export class ModelRouterService {
     }
 
     if (this.googleAvailable) {
-      if (
-        entry?.family === "claude" &&
-        canPublicClaudeModelUseGoogle(normalized)
-      ) {
+      if (isOpus) {
+        // Opus models always route through google-claude
+        if (canPublicClaudeModelUseGoogle(normalized)) {
+          const opusCloudCodeId =
+            entry?.family === "claude"
+              ? entry.cloudCodeId
+              : "claude-opus-4-6-thinking"
+          candidates.push({
+            backend: "google-claude",
+            model: opusCloudCodeId,
+            isThinking: true,
+          })
+        }
+      } else if (entry && canPublicClaudeModelUseGoogle(normalized)) {
+        // Non-Opus Claude models (Sonnet, Haiku, etc.) → use Gemini instead
+        // to save Claude quota for important tasks.
+        // Guard: only redirect known, valid Claude model IDs — unknown or
+        // misspelled IDs fall through so they surface an unsupported-model error.
+        // We still use google-claude backend to keep shouldFallbackFromBackend()
+        // claude-api ↔ google-claude pair working correctly.
+        this.logger.log(
+          `[ROUTE] Non-Opus Claude model "${cursorModel}" redirected to Gemini 3.1 Pro High`
+        )
         candidates.push({
           backend: "google-claude",
-          model: entry.cloudCodeId,
-          isThinking: entry.isThinking,
-        })
-      } else if (
-        isOpusModel(normalized) &&
-        canPublicClaudeModelUseGoogle(normalized)
-      ) {
-        candidates.push({
-          backend: "google-claude",
-          model: "claude-opus-4-6-thinking",
-          isThinking: true,
+          model: "gemini-3.1-pro-high",
+          isThinking: false,
         })
       }
     }
@@ -415,15 +426,33 @@ export class ModelRouterService {
   }
 
   /**
+   * Strip vendor prefixes like "anthropic/", "openai/", "google/" from model IDs.
+   * Claude Code CLI sends model IDs such as "anthropic/claude-sonnet-4.6".
+   */
+  private stripVendorPrefix(model: string): string {
+    const trimmed = model.trim()
+    const slashIndex = trimmed.indexOf("/")
+    if (slashIndex <= 0 || slashIndex === trimmed.length - 1) {
+      return trimmed
+    }
+    const prefix = trimmed.slice(0, slashIndex).toLowerCase()
+    if (["anthropic", "openai", "google", "meta"].includes(prefix)) {
+      return trimmed.slice(slashIndex + 1)
+    }
+    return trimmed
+  }
+
+  /**
    * Resolve model to appropriate backend.
    * Uses unified model-registry for all name resolution.
    */
   resolveModel(cursorModel: string): ModelRouteResult {
-    const normalized = cursorModel.toLowerCase().trim()
+    const stripped = this.stripVendorPrefix(cursorModel)
+    const normalized = stripped.toLowerCase().trim()
     const family = detectModelFamily(normalized)
     const entry = resolveCloudCodeModel(normalized)
-    const gptCandidates = this.getGptBackendCandidates(cursorModel)
-    const claudeCandidates = this.buildClaudeBackendCandidates(cursorModel)
+    const gptCandidates = this.getGptBackendCandidates(stripped)
+    const claudeCandidates = this.buildClaudeBackendCandidates(stripped)
 
     // 1. Known model with registry entry
     if (entry) {

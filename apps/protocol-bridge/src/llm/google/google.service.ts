@@ -2906,7 +2906,7 @@ export class GoogleService {
       )
     }
 
-    const resolvedModel = this.resolveClaudeModel(dto.model)
+    let resolvedModel = this.resolveClaudeModel(dto.model)
     this.logger.log(
       `Sending Claude request via Cloud Code API: ${resolvedModel}`
     )
@@ -3006,7 +3006,31 @@ export class GoogleService {
           const waitMs =
             this.processPool.getMinCooldownMsForModel(resolvedModel)
           if (waitMs > this.MAX_429_WAIT_MS) {
-            // Cooldown too long (quota exhausted on all accounts) — return 429 with Retry-After
+            // Check if quota fallback model is configured
+            const fallbackModel = this.processPool.quotaFallbackModel
+            if (fallbackModel && resolvedModel !== fallbackModel) {
+              this.logger.warn(
+                `All workers quota exhausted for ${resolvedModel}, falling back to ${fallbackModel}`
+              )
+              // Replace model in payload and strip thinking config
+              payload.model = fallbackModel
+              resolvedModel = fallbackModel
+              const request = payload.request as
+                | Record<string, unknown>
+                | undefined
+              if (request?.generationConfig) {
+                const genConfig = request.generationConfig as Record<
+                  string,
+                  unknown
+                >
+                delete genConfig.thinkingConfig
+              }
+              // Reset retry state — give fallback model fresh attempts
+              lastError = null
+              attempt = -1 // will be incremented to 0
+              continue
+            }
+            // No fallback configured — return 429 with Retry-After
             this.logger.error(
               `All workers quota exhausted for ${resolvedModel}, shortest cooldown: ${waitMs}ms (exceeds max wait)`
             )
@@ -3088,7 +3112,7 @@ export class GoogleService {
 
     // Quota management handled by native process pool
 
-    const resolvedModel = this.resolveClaudeModel(dto.model)
+    let resolvedModel = this.resolveClaudeModel(dto.model)
     // eslint-disable-next-line @typescript-eslint/no-this-alias
     const self = this
     this.logger.log(
@@ -3298,7 +3322,31 @@ export class GoogleService {
               self.processPool.getMinCooldownMsForModel(resolvedModel)
 
             if (waitMs > self.MAX_429_WAIT_MS) {
-              // Cooldown too long — return 429 with context
+              // Check if quota fallback model is configured
+              const fallbackModel = self.processPool.quotaFallbackModel
+              if (fallbackModel && resolvedModel !== fallbackModel) {
+                self.logger.warn(
+                  `All workers quota exhausted for ${resolvedModel}, falling back to ${fallbackModel} (streaming)`
+                )
+                // Replace model in payload and strip thinking config
+                payload.model = fallbackModel
+                const request = payload.request as
+                  | Record<string, unknown>
+                  | undefined
+                if (request?.generationConfig) {
+                  const genConfig = request.generationConfig as Record<
+                    string,
+                    unknown
+                  >
+                  delete genConfig.thinkingConfig
+                }
+                // Reset state for fresh attempt with fallback model
+                resolvedModel = fallbackModel
+                hasWaitedForRecovery = false
+                workerAttempt = -1 // will be incremented to 0
+                continue
+              }
+              // No fallback configured — return 429 with context
               self.logger.error(
                 `All workers quota exhausted for ${resolvedModel}, shortest cooldown: ${waitMs}ms (exceeds max wait ${self.MAX_429_WAIT_MS}ms)`
               )

@@ -186,6 +186,23 @@ Behavior:
 
 - Credentials are synced into `apps/protocol-bridge/data/antigravity-accounts.json`.
 - Supports multi-account rotation.
+- **Claude model routing:** When Claude Code CLI routes through the Google backend,
+  only **Opus** models use the Claude-through-Google (Cloud Code) path.
+  Non-Opus Claude models (Sonnet, Haiku, etc.) are automatically redirected to
+  **Gemini 3.1 Pro High**, preserving Claude quota for complex agentic tasks.
+- **Quota fallback (opt-in):** When all Google Cloud Code accounts are quota-exhausted
+  and the cooldown exceeds the max wait threshold, the system can automatically fall back
+  to a configured Gemini model instead of returning a 429 error.
+  Configure by adding `"quotaFallbackModel"` to the top level of `antigravity-accounts.json`:
+
+```json
+{
+  "quotaFallbackModel": "gemini-3.1-pro-high",
+  "accounts": [...]
+}
+```
+
+Set `"quotaFallbackModel"` to the desired fallback model ID, or remove the field entirely to disable (default: disabled — returns 429 as before).
 
 ### 2. GPT
 

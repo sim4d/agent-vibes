@@ -7,6 +7,7 @@ import { HttpsProxyAgent } from "https-proxy-agent"
 import { SocksProxyAgent } from "socks-proxy-agent"
 import type { CreateMessageDto } from "../../protocol/anthropic/dto/create-message.dto"
 import type { AnthropicResponse } from "../../shared/anthropic"
+import { applyPromptCachingOptimizations } from "./prompt-caching"
 import {
   getAccountConfigPathCandidates,
   resolveLegacyAccountStatePath as resolveLegacyAccountStateJsonPath,
@@ -131,6 +132,18 @@ const DEFAULT_FORWARDED_HEADERS: Record<string, string> = {
   "user-agent": "claude-cli/2.1.70 (external, cli)",
 }
 
+/**
+ * Required beta features that must always be present in Anthropic-Beta header.
+ * Updated to match Claude Code 2.1.70 / CLIProxyAPI latest.
+ */
+const REQUIRED_BETA_FEATURES = [
+  "claude-code-20250219",
+  "oauth-2025-04-20",
+  "interleaved-thinking-2025-05-14",
+  "context-management-2025-06-27",
+  "prompt-caching-scope-2026-01-05",
+] as const
+
 const MODEL_DISCOVERY_TIMEOUT_MS = 8_000
 const MODEL_DISCOVERY_MAX_PAGES = 5
 const MODEL_DISCOVERY_TTL_MS = 15 * 60_000
@@ -239,38 +252,123 @@ export class ClaudeApiService implements OnModuleInit {
   }
 
   /**
-   * Hot-reload accounts from config file.
-   * Adds new accounts without disturbing existing account state (cooldown, disabled, etc.).
-   * Triggers model discovery for newly added accounts.
-   * Returns the number of newly added accounts.
+   * Hot-reload accounts from config file — full reconcile.
+   *
+   * Performs a three-way reconciliation (add / update / delete):
+   * - ADD: New accounts not yet in the pool are appended and trigger model discovery.
+   * - UPDATE: Existing accounts whose mutable config changed (label, baseUrl,
+   *   proxyUrl, stripThinking, priority, headers, models, excludedModels) are
+   *   patched in-place.  Runtime state (cooldown, disabled, modelStates) is preserved.
+   * - DELETE: File-sourced accounts that no longer appear in the config are removed.
+   *   Env-sourced accounts are never deleted.
+   *
+   * Returns the total number of account changes (add/update/remove).
    */
   async reloadAccounts(): Promise<number> {
     const freshAccounts = this.loadAllAccountsFromFile()
-    const existingKeys = new Set(this.accounts.map((a) => a.stateKey))
-    const newAccounts: ClaudeApiAccount[] = []
+    const freshKeys = new Set(freshAccounts.map((a) => a.stateKey))
+    const existingByKey = new Map(this.accounts.map((a) => [a.stateKey, a]))
     const persistedStates = this.loadPersistedAccountStates()
 
-    for (const account of freshAccounts) {
-      if (!existingKeys.has(account.stateKey)) {
+    let added = 0
+    let updated = 0
+    let removed = 0
+    const newAccounts: ClaudeApiAccount[] = []
+
+    // ── ADD + UPDATE ──
+    for (const fresh of freshAccounts) {
+      const existing = existingByKey.get(fresh.stateKey)
+
+      if (!existing) {
+        // New account — add
         this.applyPersistedAccountState(
-          account,
-          persistedStates.get(account.stateKey)
+          fresh,
+          persistedStates.get(fresh.stateKey)
         )
-        this.accounts.push(account)
-        existingKeys.add(account.stateKey)
-        newAccounts.push(account)
+        this.accounts.push(fresh)
+        newAccounts.push(fresh)
+        added++
         this.logger.log(
-          `[Hot-reload] Added new Claude API account: ${account.label || account.baseUrl}`
+          `[Hot-reload] Added Claude API account: ${fresh.label || fresh.baseUrl}`
         )
+      } else {
+        // Existing account — patch mutable fields, preserve runtime state
+        let changed = false
+
+        if (existing.label !== fresh.label) {
+          existing.label = fresh.label
+          changed = true
+        }
+        if (existing.baseUrl !== fresh.baseUrl) {
+          existing.baseUrl = fresh.baseUrl
+          changed = true
+        }
+        if (existing.proxyUrl !== fresh.proxyUrl) {
+          existing.proxyUrl = fresh.proxyUrl
+          changed = true
+        }
+        if (existing.stripThinking !== fresh.stripThinking) {
+          existing.stripThinking = fresh.stripThinking
+          changed = true
+        }
+        if (existing.priority !== fresh.priority) {
+          existing.priority = fresh.priority
+          changed = true
+        }
+        if (
+          JSON.stringify(existing.headers) !== JSON.stringify(fresh.headers)
+        ) {
+          existing.headers = fresh.headers
+          changed = true
+        }
+        if (JSON.stringify(existing.models) !== JSON.stringify(fresh.models)) {
+          existing.models = fresh.models
+          changed = true
+        }
+        if (
+          JSON.stringify(existing.excludedModels) !==
+          JSON.stringify(fresh.excludedModels)
+        ) {
+          existing.excludedModels = fresh.excludedModels
+          changed = true
+        }
+
+        if (changed) {
+          updated++
+          this.logger.log(
+            `[Hot-reload] Updated Claude API account: ${existing.label || existing.baseUrl}`
+          )
+        }
       }
     }
 
-    if (newAccounts.length > 0) {
+    // ── DELETE — only remove file-sourced accounts that are no longer in config ──
+    const beforeCount = this.accounts.length
+    this.accounts = this.accounts.filter((account) => {
+      // Never remove env-sourced accounts
+      if (account.source === "env") return true
+      // Keep accounts that still exist in the fresh config
+      if (freshKeys.has(account.stateKey)) return true
+      // Remove stale file-sourced accounts
+      removed++
+      this.logger.log(
+        `[Hot-reload] Removed Claude API account: ${account.label || account.baseUrl}`
+      )
+      return false
+    })
+
+    // ── persist + log ──
+    const totalChanges = added + updated + removed
+    if (totalChanges > 0) {
       this.persistAccountStates()
       this.logger.log(
-        `[Hot-reload] Claude API: ${newAccounts.length} new account(s) added, total=${this.accounts.length}`
+        `[Hot-reload] Claude API reconcile: +${added} ~${updated} -${removed}, ` +
+          `total=${this.accounts.length} (was ${beforeCount})`
       )
-      // Trigger model discovery for new accounts
+    }
+
+    // Trigger model discovery for newly added accounts
+    if (newAccounts.length > 0) {
       await Promise.allSettled(
         newAccounts.map((account) =>
           this.refreshDiscoveredModelsForAccount(account, { force: true })
@@ -278,7 +376,18 @@ export class ClaudeApiService implements OnModuleInit {
       )
     }
 
-    return newAccounts.length
+    // Trigger model re-discovery for updated accounts whose model config changed
+    if (updated > 0) {
+      await Promise.allSettled(
+        this.accounts
+          .filter((a) => this.shouldDiscoverModelsForAccount(a))
+          .map((a) =>
+            this.refreshDiscoveredModelsForAccount(a, { force: true })
+          )
+      )
+    }
+
+    return totalChanges
   }
 
   checkAvailability(): Promise<boolean> {
@@ -386,6 +495,98 @@ export class ClaudeApiService implements OnModuleInit {
       family: "claude",
       isThinking: model.isThinking,
     }))
+  }
+
+  /**
+   * Proxy a count_tokens request to the upstream Anthropic API.
+   * Returns the upstream response if a suitable Claude API account is available,
+   * or null if no account can serve this model (caller should fall back to local estimation).
+   */
+  async countTokensUpstream(
+    dto: Record<string, unknown>
+  ): Promise<{ input_tokens: number } | null> {
+    const model = typeof dto.model === "string" ? dto.model : ""
+    if (!model) return null
+
+    const candidates = this.getAvailableCandidatesInAttemptOrder(
+      this.resolveCandidates(model).filter((candidate) =>
+        this.shouldApplyOfficialAnthropicOptimizations(candidate.account)
+      )
+    )
+    if (candidates.length === 0) return null
+
+    for (const candidate of candidates) {
+      const account = candidate.account
+      const request = this.buildUpstreamRequestPayload(
+        dto,
+        candidate.upstreamModel,
+        account,
+        {
+          applyPromptCaching: true,
+        }
+      )
+      const url = this.buildCountTokensUrl(account.baseUrl)
+      const headers = this.buildHeadersForAccount(
+        account,
+        false,
+        {},
+        request.betas
+      )
+      const fetchOptions: RequestInit & { dispatcher?: unknown } = {
+        method: "POST",
+        headers,
+        body: JSON.stringify(request.body),
+      }
+
+      const dispatcher = this.buildProxyAgent(account)
+      if (dispatcher) {
+        fetchOptions.dispatcher = dispatcher
+      }
+
+      try {
+        const response = await this.fetchWithResponseHeadersTimeout(
+          url,
+          fetchOptions,
+          10_000,
+          "count_tokens upstream timed out"
+        )
+
+        if (!response.ok) {
+          const errorBody = await response.text()
+          this.buildHttpFailureError(
+            account,
+            response.status,
+            errorBody,
+            candidate.upstreamModel,
+            response.headers.get("retry-after") || undefined
+          )
+          this.logger.debug(
+            `[Claude API] count_tokens upstream failed: account=${account.label || account.baseUrl}, status=${response.status}`
+          )
+          continue
+        }
+
+        const result = (await response.json()) as { input_tokens?: number }
+        if (typeof result.input_tokens === "number") {
+          this.markAccountHealthy(account, candidate.upstreamModel)
+          return { input_tokens: result.input_tokens }
+        }
+
+        this.markAccountTemporaryFailure(account, 502, candidate.upstreamModel)
+        this.logger.debug(
+          `[Claude API] count_tokens upstream returned invalid payload for ${account.label || account.baseUrl}`
+        )
+      } catch (error) {
+        this.markAccountTemporaryFailure(account, 504, candidate.upstreamModel)
+        this.logger.debug(
+          `[Claude API] count_tokens upstream error for ${account.label || account.baseUrl}: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        )
+      }
+    }
+
+    return null
   }
 
   async sendClaudeMessage(
@@ -1656,24 +1857,14 @@ export class ClaudeApiService implements OnModuleInit {
     body: Record<string, unknown>
     betas: string[]
   } {
-    const raw = JSON.parse(JSON.stringify(dto)) as Record<string, unknown>
-    const betas = this.normalizeBetas(raw.betas)
-
-    delete raw.betas
-    delete raw._conversationId
-    delete raw._contextTokenBudget
-    delete raw._pendingToolUseIds
-
-    raw.model = candidate.upstreamModel
-    if (candidate.account.stripThinking) {
-      delete raw.thinking
-      delete raw.output_config
-    }
-
-    return {
-      body: raw,
-      betas,
-    }
+    return this.buildUpstreamRequestPayload(
+      dto as unknown as Record<string, unknown>,
+      candidate.upstreamModel,
+      candidate.account,
+      {
+        applyPromptCaching: true,
+      }
+    )
   }
 
   private normalizeBetas(raw: unknown): string[] {
@@ -1716,21 +1907,40 @@ export class ClaudeApiService implements OnModuleInit {
       headers[key.toLowerCase()] = value.trim()
     }
 
-    if (betas.length > 0) {
-      const existing = headers["anthropic-beta"]
-        ? headers["anthropic-beta"]
-            .split(",")
-            .map((value) => value.trim())
-            .filter(Boolean)
-        : []
-      const merged = new Set([...existing, ...betas])
-      headers["anthropic-beta"] = Array.from(merged).join(",")
-    }
-
     if (account.headers) {
       for (const [key, value] of Object.entries(account.headers)) {
         headers[key.toLowerCase()] = value
       }
+    }
+
+    // Build the beta header after all header sources are merged so custom
+    // account headers cannot accidentally erase required official betas.
+    const baseBetaStr =
+      headers["anthropic-beta"] ||
+      (this.shouldApplyOfficialAnthropicOptimizations(account)
+        ? REQUIRED_BETA_FEATURES.join(",")
+        : "")
+    const existingBetas = baseBetaStr
+      .split(",")
+      .map((v) => v.trim())
+      .filter(Boolean)
+    const betaSet = new Set(existingBetas)
+
+    if (this.shouldApplyOfficialAnthropicOptimizations(account)) {
+      for (const required of REQUIRED_BETA_FEATURES) {
+        betaSet.add(required)
+      }
+    }
+
+    // Merge betas extracted from the request body
+    for (const beta of betas) {
+      betaSet.add(beta)
+    }
+
+    if (betaSet.size > 0) {
+      headers["anthropic-beta"] = Array.from(betaSet).join(",")
+    } else {
+      delete headers["anthropic-beta"]
     }
 
     if (this.isOfficialAnthropicBase(account.baseUrl)) {
@@ -1741,6 +1951,8 @@ export class ClaudeApiService implements OnModuleInit {
       headers.authorization = `Bearer ${account.apiKey}`
     }
 
+    // Re-enforce identity encoding for streams after custom headers.
+    // Compressed SSE breaks the line scanner regardless of user preference.
     if (stream) {
       headers["accept-encoding"] = "identity"
     }
@@ -1767,6 +1979,10 @@ export class ClaudeApiService implements OnModuleInit {
       : `${normalized}/v1/messages`
   }
 
+  private buildCountTokensUrl(baseUrl: string): string {
+    return `${this.buildMessagesUrl(baseUrl)}/count_tokens`
+  }
+
   private buildModelsUrl(baseUrl: string, afterId?: string): string {
     const normalized = baseUrl.replace(/\/+$/, "")
     const url = new URL(
@@ -1779,6 +1995,90 @@ export class ClaudeApiService implements OnModuleInit {
       url.searchParams.set("after_id", afterId)
     }
     return url.toString()
+  }
+
+  private shouldApplyOfficialAnthropicOptimizations(
+    account: ClaudeApiAccount
+  ): boolean {
+    return this.isOfficialAnthropicBase(account.baseUrl)
+  }
+
+  private buildUpstreamRequestPayload(
+    dto: Record<string, unknown>,
+    upstreamModel: string,
+    account: ClaudeApiAccount,
+    options: {
+      applyPromptCaching?: boolean
+    } = {}
+  ): {
+    body: Record<string, unknown>
+    betas: string[]
+  } {
+    const raw = JSON.parse(JSON.stringify(dto)) as Record<string, unknown>
+    const betas = this.normalizeBetas(raw.betas)
+
+    delete raw.betas
+    delete raw._conversationId
+    delete raw._contextTokenBudget
+    delete raw._pendingToolUseIds
+
+    raw.model = upstreamModel
+    if (account.stripThinking) {
+      delete raw.thinking
+      delete raw.output_config
+    }
+
+    if (
+      options.applyPromptCaching &&
+      this.shouldApplyOfficialAnthropicOptimizations(account)
+    ) {
+      // Keep Anthropic-only request shaping away from third-party
+      // Claude-compatible providers that only support the base messages API.
+      applyPromptCachingOptimizations(raw)
+    }
+
+    return {
+      body: raw,
+      betas,
+    }
+  }
+
+  private getAvailableCandidatesInAttemptOrder(
+    candidates: ClaudeApiCandidate[]
+  ): ClaudeApiCandidate[] {
+    const now = Date.now()
+    const availableByPriority = new Map<number, ClaudeApiCandidate[]>()
+
+    for (const candidate of candidates) {
+      if (
+        isAccountDisabled(candidate.account) ||
+        !isAccountAvailableForModel(
+          candidate.account,
+          candidate.upstreamModel,
+          now
+        )
+      ) {
+        continue
+      }
+
+      const list = availableByPriority.get(candidate.account.priority) || []
+      list.push(candidate)
+      availableByPriority.set(candidate.account.priority, list)
+    }
+
+    const priorities = Array.from(availableByPriority.keys()).sort(
+      (left, right) => right - left
+    )
+
+    return priorities.flatMap((priority, index) => {
+      const pool = availableByPriority.get(priority) || []
+      if (pool.length <= 1) {
+        return pool
+      }
+
+      const startIndex = index === 0 ? this.accountIndex % pool.length : 0
+      return pool.slice(startIndex).concat(pool.slice(0, startIndex))
+    })
   }
 
   private buildProxyAgent(
