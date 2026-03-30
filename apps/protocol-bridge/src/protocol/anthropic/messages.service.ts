@@ -486,12 +486,47 @@ export class MessagesService implements OnModuleInit {
   }
 
   /**
-   * Count tokens in a request
+   * Count tokens in a request.
+   *
+   * Strategy:
+   * 1. Try upstream /v1/messages/count_tokens for exact results.
+   * 2. Fall back to local estimation if upstream is unavailable or fails.
+   *
    * Reference: https://docs.anthropic.com/en/api/messages-count-tokens
    */
-  countTokens(dto: CountTokensDto): { input_tokens: number } {
+  async countTokens(dto: CountTokensDto): Promise<{ input_tokens: number }> {
     this.logger.log(`Count tokens request for model: ${dto.model}`)
 
+    // ── Upstream first ──
+    try {
+      const upstreamResult = await this.claudeApiService.countTokensUpstream(
+        dto as unknown as Record<string, unknown>
+      )
+      if (upstreamResult) {
+        this.logger.debug(
+          `Count tokens (upstream): ${upstreamResult.input_tokens}`
+        )
+        return upstreamResult
+      }
+    } catch (error) {
+      this.logger.debug(
+        `Count tokens upstream failed, falling back to local estimation: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      )
+    }
+
+    // ── Local fallback ──
+    const localTokens = this.countTokensLocal(dto)
+    this.logger.debug(`Count tokens (local estimate): ${localTokens}`)
+    return { input_tokens: localTokens }
+  }
+
+  /**
+   * Local token count estimation.
+   * Less accurate than the upstream API but zero-latency and always available.
+   */
+  private countTokensLocal(dto: CountTokensDto): number {
     let totalTokens = 0
 
     // Count system prompt tokens
@@ -564,9 +599,7 @@ export class MessagesService implements OnModuleInit {
     // Add message separator tokens
     totalTokens += 3
 
-    this.logger.debug(`Count tokens result: ${totalTokens}`)
-
-    return { input_tokens: totalTokens }
+    return totalTokens
   }
 
   listModels() {

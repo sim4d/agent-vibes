@@ -11,12 +11,31 @@ import {
   NestFastifyApplication,
 } from "@nestjs/platform-fastify"
 import { DocumentBuilder, SwaggerModule } from "@nestjs/swagger"
+import { execSync } from "child_process"
 import * as fs from "fs"
 import * as path from "path"
 import { AppModule } from "./app.module"
 import { ModelRouterService } from "./llm/model-router.service"
 import { registerContentTypeParsers } from "./shared/content-type-parsers"
 import { registerRequestHooks } from "./shared/request-hooks"
+
+// ── Auto-configure NODE_EXTRA_CA_CERTS for mkcert CA ──────────────────
+// Electron/Node.js does NOT read macOS System Keychain for TLS trust.
+// This ensures the mkcert root CA is trusted by all Node.js HTTPS clients.
+if (!process.env.NODE_EXTRA_CA_CERTS) {
+  try {
+    const caRoot = execSync("mkcert -CAROOT", {
+      encoding: "utf-8",
+      stdio: "pipe",
+    }).trim()
+    const caRootPem = path.join(caRoot, "rootCA.pem")
+    if (fs.existsSync(caRootPem)) {
+      process.env.NODE_EXTRA_CA_CERTS = caRootPem
+    }
+  } catch {
+    // mkcert not installed or not in PATH — ignore
+  }
+}
 
 async function bootstrap() {
   // ── Debug Mode ─────────────────────────────────────────────────────

@@ -1104,6 +1104,11 @@ export function canPublicClaudeModelUseGoogle(modelId: string): boolean {
     return false
   }
 
+  // Opus models always route through Google (only thinking variant exists)
+  if (isOpusModel(modelId)) {
+    return true
+  }
+
   return resolved.isThinking || !resolved.cloudCodeId.includes("thinking")
 }
 

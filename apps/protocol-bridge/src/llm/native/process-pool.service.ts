@@ -130,6 +130,8 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
   private readonly GENERATE_TIMEOUT_MS = 3_600_000 // 1 hour
   private antigravityNodeBinary: string | null = null
   private antigravityNodeModules: string | null = null
+  /** Model to fallback to when all Claude workers are quota-exhausted (configured in antigravity-accounts.json) */
+  private _quotaFallbackModel: string | null = null
 
   constructor(private readonly configService: ConfigService) {}
 
@@ -297,11 +299,22 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
         try {
           const data = JSON.parse(fs.readFileSync(configPath, "utf-8")) as {
             accounts?: NativeAccount[]
+            quotaFallbackModel?: string
           }
           if (Array.isArray(data.accounts) && data.accounts.length > 0) {
             this.logger.log(
               `Loaded ${data.accounts.length} account(s) from ${configPath}`
             )
+            // Load quota fallback model config
+            if (
+              typeof data.quotaFallbackModel === "string" &&
+              data.quotaFallbackModel.trim()
+            ) {
+              this._quotaFallbackModel = data.quotaFallbackModel.trim()
+              this.logger.log(
+                `Quota fallback model configured: ${this._quotaFallbackModel}`
+              )
+            }
             return data.accounts
           }
         } catch (err) {
@@ -316,6 +329,15 @@ export class ProcessPoolService implements OnModuleInit, OnModuleDestroy {
       "No Antigravity accounts configured — run: npm run antigravity:sync -- --ide"
     )
     return []
+  }
+
+  /**
+   * Get the configured quota fallback model.
+   * When all Claude workers are quota-exhausted, the system can fallback to this model
+   * instead of returning 429 to the client.
+   */
+  get quotaFallbackModel(): string | null {
+    return this._quotaFallbackModel
   }
 
   /**

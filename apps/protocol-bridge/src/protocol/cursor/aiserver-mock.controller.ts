@@ -810,11 +810,11 @@ export class AiserverMockController {
       // 1. Hot-reload accounts from config files
       const openaiAdded = this.openaiCompatService.reloadAccounts()
       const codexAdded = this.codexService.reloadAccounts()
-      const claudeAdded = await this.claudeApiService.reloadAccounts()
+      const claudeChanges = await this.claudeApiService.reloadAccounts()
 
-      if (openaiAdded + codexAdded + claudeAdded > 0) {
+      if (openaiAdded + codexAdded + claudeChanges > 0) {
         this.logger.log(
-          `[Model Refresh] Hot-reloaded accounts: openai-compat=${openaiAdded}, codex=${codexAdded}, claude-api=${claudeAdded}`
+          `[Model Refresh] Hot-reloaded accounts: openai-compat(add)=${openaiAdded}, codex(add)=${codexAdded}, claude-api(changes)=${claudeChanges}`
         )
       }
 
